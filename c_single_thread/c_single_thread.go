@@ -69,6 +69,52 @@ type Metricas struct {
 	NumTilesRED      int // Nuevo campo
 }
 
+// MetricasLectura contiene las métricas asociadas a la lectura de un archivo JP2
+type MetricasLectura struct {
+	TiempoArchivo time.Duration // Tiempo de apertura del archivo
+	TiempoDecodif time.Duration // Tiempo de decodificación
+	NumTiles      int           // Número de tiles en la imagen
+	TiempoTotal   time.Duration // Tiempo total de lectura
+}
+
+// ResultadoBanda contiene una imagen JP2 y sus métricas de lectura
+type ResultadoBanda struct {
+	Imagen   *JP2Image
+	Metricas MetricasLectura
+}
+
+// MetricasNDVI contiene las métricas del cálculo de NDVI
+type MetricasNDVI struct {
+	Tiempo          time.Duration
+	PixelesTotales  int
+	PixelesSinDatos int
+	Min             float64
+	Max             float64
+	Promedio        float64
+}
+
+// MetricasColor contiene las métricas de la colorización
+type MetricasColor struct {
+	Tiempo       time.Duration
+	TamanoImagen int64
+}
+
+// MetricasGuardado contiene las métricas del proceso de guardado
+type MetricasGuardado struct {
+	Tiempo time.Duration
+}
+
+// MetricasProcesoCompleto agrupa todas las métricas del proceso
+type MetricasProcesoCompleto struct {
+	Resolucion  string
+	NIR         MetricasLectura
+	RED         MetricasLectura
+	NDVI        MetricasNDVI
+	Color       MetricasColor
+	Guardado    MetricasGuardado
+	TiempoTotal time.Duration
+}
+
 // JP2Image representa una imagen JPEG2000 decodificada
 type JP2Image struct {
 	Width, Height int
@@ -114,10 +160,13 @@ func ndviColorOptimized(ndviValue float64) color.RGBA {
 	return color.RGBA{r, g, b, 255}
 }
 
-// readJP2Direct lee un archivo JP2 directamente usando OpenJPEG con soporte para múltiples hilos
-func readJP2Direct(filePath string, threads int) (*JP2Image, time.Duration, time.Duration, int, error) {
-	var tiempoArchivo, tiempoDecodif time.Duration
-	var numTiles int
+// readJP2Direct: Simplificar la firma devolviendo una estructura ResultadoBanda
+func readJP2Direct(filePath string, threads int) (*ResultadoBanda, error) {
+	resultado := &ResultadoBanda{
+		Metricas: MetricasLectura{},
+	}
+
+	inicioTotal := time.Now()
 
 	// Medir tiempo de apertura del archivo
 	inicioArchivo := time.Now()
@@ -129,11 +178,11 @@ func readJP2Direct(filePath string, threads int) (*JP2Image, time.Duration, time
 	// Configurar el stream
 	stream := C.opj_stream_create_default_file_stream(cFilePath, 1)
 	if stream == nil {
-		return nil, 0, 0, 0, fmt.Errorf("no se pudo abrir el archivo: %s", filePath)
+		return nil, fmt.Errorf("no se pudo abrir el archivo: %s", filePath)
 	}
 	defer C.opj_stream_destroy(stream)
 
-	tiempoArchivo = time.Since(inicioArchivo)
+	resultado.Metricas.TiempoArchivo = time.Since(inicioArchivo)
 
 	// Medir tiempo de decodificación
 	inicioDecodif := time.Now()
@@ -141,7 +190,7 @@ func readJP2Direct(filePath string, threads int) (*JP2Image, time.Duration, time
 	// Crear el codec
 	codec := C.opj_create_decompress(C.OPJ_CODEC_JP2)
 	if codec == nil {
-		return nil, tiempoArchivo, 0, 0, fmt.Errorf("no se pudo crear el codec JP2")
+		return nil, fmt.Errorf("no se pudo crear el codec JP2")
 	}
 	defer C.opj_destroy_codec(codec)
 
@@ -155,7 +204,7 @@ func readJP2Direct(filePath string, threads int) (*JP2Image, time.Duration, time
 	C.opj_set_default_decoder_parameters(&parameters)
 
 	if C.opj_setup_decoder(codec, &parameters) == C.OPJ_FALSE {
-		return nil, tiempoArchivo, 0, 0, fmt.Errorf("error al configurar el decodificador")
+		return nil, fmt.Errorf("error al configurar el decodificador")
 	}
 
 	// Configurar el número de hilos si se especifica más de 1
@@ -170,10 +219,11 @@ func readJP2Direct(filePath string, threads int) (*JP2Image, time.Duration, time
 	// Leer el header
 	var image *C.opj_image_t
 	if C.opj_read_header(stream, codec, &image) == C.OPJ_FALSE {
-		return nil, tiempoArchivo, 0, 0, fmt.Errorf("error al leer el header de la imagen")
+		return nil, fmt.Errorf("error al leer el header de la imagen")
 	}
 
 	// Obtener información sobre los tiles después de leer el encabezado
+	var numTiles int = 1 // Valor por defecto si no se puede obtener la info
 	cstrInfo := C.opj_get_cstr_info(codec)
 	if cstrInfo != nil {
 		numTiles = int(cstrInfo.tw * cstrInfo.th)
@@ -183,7 +233,7 @@ func readJP2Direct(filePath string, threads int) (*JP2Image, time.Duration, time
 	// Decodificar la imagen
 	if C.opj_decode(codec, stream, image) == C.OPJ_FALSE {
 		C.opj_image_destroy(image)
-		return nil, tiempoArchivo, 0, 0, fmt.Errorf("error al decodificar la imagen")
+		return nil, fmt.Errorf("error al decodificar la imagen")
 	}
 
 	// Convertir la imagen de OpenJPEG a nuestro formato
@@ -216,64 +266,79 @@ func readJP2Direct(filePath string, threads int) (*JP2Image, time.Duration, time
 	// Liberar memoria de la imagen
 	C.opj_image_destroy(image)
 
-	tiempoDecodif = time.Since(inicioDecodif)
+	resultado.Metricas.TiempoDecodif = time.Since(inicioDecodif)
+	resultado.Metricas.NumTiles = numTiles
+	resultado.Metricas.TiempoTotal = time.Since(inicioTotal)
+	resultado.Imagen = jp2Image
 
-	// Devolver también el número de tiles
-	return jp2Image, tiempoArchivo, tiempoDecodif, numTiles, nil
+	return resultado, nil
 }
 
-func procesarNDVIMulti(archivoNIR, archivoRED, resolucion string, numCPUs int) (*Metricas, error) {
-	metricas := &Metricas{
-		Resolucion: resolucion,
-		NDVIMin:    math.MaxFloat64,
-		NDVIMax:    -math.MaxFloat64,
-	}
-
-	inicioTotal := time.Now()
-
-	// Leer imágenes en paralelo
-	var nirImg, redImg *JP2Image
-	var tiempoArchivoNIR, tiempoDecodifNIR, tiempoArchivoRED, tiempoDecodifRED time.Duration
-	var numTilesNIR, numTilesRED int
-	var errNIR, errRED error
-
+// leerImagenes: Simplificar la firma devolviendo las imágenes y sus métricas agrupadas
+func leerImagenesCPU(archivoNIR, archivoRED string, numCPUs int) (*ResultadoBanda, *ResultadoBanda, time.Duration, error) {
 	inicioLectura := time.Now()
 
-	// Leer NIR en una goroutine
-	nirImg, tiempoArchivoNIR, tiempoDecodifNIR, numTilesNIR, errNIR = readJP2Direct(archivoNIR, numCPUs)
-
-	// Leer RED en otra goroutine
-	redImg, tiempoArchivoRED, tiempoDecodifRED, numTilesRED, errRED = readJP2Direct(archivoRED, numCPUs)
-
-	metricas.TiempoLectura = time.Since(inicioLectura)
-
-	if errNIR != nil {
-		return nil, fmt.Errorf("error al leer NIR: %v", errNIR)
-	}
-	if errRED != nil {
-		return nil, fmt.Errorf("error al leer RED: %v", errRED)
+	// Leer NIR
+	nirResultado, err := readJP2Direct(archivoNIR, numCPUs)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("error al leer NIR: %v", err)
 	}
 
-	metricas.TiempoArchivoNIR = tiempoArchivoNIR
-	metricas.TiempoArchivoRED = tiempoArchivoRED
-	metricas.TiempoDecodifNIR = tiempoDecodifNIR
-	metricas.TiempoDecodifRED = tiempoDecodifRED
-	metricas.NumTilesNIR = numTilesNIR
-	metricas.NumTilesRED = numTilesRED
-	// Mantener los promedios para compatibilidad
-	metricas.TiempoArchivo = (tiempoArchivoNIR + tiempoArchivoRED) / 2
-	metricas.TiempoDecodif = (tiempoDecodifNIR + tiempoDecodifRED) / 2
+	// Leer RED
+	redResultado, err := readJP2Direct(archivoRED, numCPUs)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("error al leer RED: %v", err)
+	}
+
+	tiempoTotal := time.Since(inicioLectura)
+
+	return nirResultado, redResultado, tiempoTotal, nil
+}
+
+// guardarImagenes guarda las imágenes de NDVI en formato PNG
+func guardarImagenes(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error) {
+	inicioGuardado := time.Now()
+
+	// Crear directorio si no existe
+	os.MkdirAll("./go_jp2_direct", 0755)
+
+	// Nombre del archivo de salida (solo color)
+	nombreColor := fmt.Sprintf("./go_jp2_direct/ndvi_%s_color.png", resolucion)
+
+	// Guardar solo la imagen color
+	colorFile, err := os.Create(nombreColor)
+	if err != nil {
+		return 0, err
+	}
+	defer colorFile.Close()
+
+	// Usar compresión rápida para mejor rendimiento
+	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+	err = encoder.Encode(colorFile, ndviColorImg)
+
+	tiempoGuardado := time.Since(inicioGuardado)
+	return tiempoGuardado, err
+}
+
+// procesarNDVIMulti: Simplificar para devolver métricas NDVI y color agrupadas
+func procesarNDVIMulti(nirResultado, redResultado *ResultadoBanda, resolucion string, numCPUs int) (*MetricasNDVI, *MetricasColor, *image.RGBA, error) {
+	metricasNDVI := &MetricasNDVI{
+		Min: math.MaxFloat64,
+		Max: -math.MaxFloat64,
+	}
+
+	metricasColor := &MetricasColor{}
 
 	// Verificar que las dimensiones sean iguales
-	if nirImg.Width != redImg.Width || nirImg.Height != redImg.Height {
-		return nil, fmt.Errorf("las dimensiones de las imágenes NIR y RED no coinciden")
+	if nirResultado.Imagen.Width != redResultado.Imagen.Width || nirResultado.Imagen.Height != redResultado.Imagen.Height {
+		return nil, nil, nil, fmt.Errorf("las dimensiones de las imágenes NIR y RED no coinciden")
 	}
 
 	// Obtener dimensiones
-	width := nirImg.Width
-	height := nirImg.Height
+	width := nirResultado.Imagen.Width
+	height := redResultado.Imagen.Height
 	pixelCount := width * height
-	metricas.Pixeles = pixelCount
+	metricasNDVI.PixelesTotales = pixelCount
 
 	// Calcular NDVI en paralelo
 	numWorkers := numCPUs
@@ -290,8 +355,8 @@ func procesarNDVIMulti(archivoNIR, archivoRED, resolucion string, numCPUs int) (
 	var wgNDVI sync.WaitGroup
 	wgNDVI.Add(numWorkers)
 
-	nirData := nirImg.Data[0]
-	redData := redImg.Data[0]
+	nirData := nirResultado.Imagen.Data[0]
+	redData := redResultado.Imagen.Data[0]
 
 	for w := range numWorkers {
 		start := w * chunkSize
@@ -337,46 +402,29 @@ func procesarNDVIMulti(archivoNIR, archivoRED, resolucion string, numCPUs int) (
 	wgNDVI.Wait()
 
 	// Calcular métricas NDVI
-	metricas.NDVIMin = minVals[0]
-	metricas.NDVIMax = maxVals[0]
+	metricasNDVI.Min = minVals[0]
+	metricasNDVI.Max = maxVals[0]
 	totalSum := sums[0]
 
 	for i := 1; i < numWorkers; i++ {
-		if minVals[i] < metricas.NDVIMin {
-			metricas.NDVIMin = minVals[i]
+		if minVals[i] < metricasNDVI.Min {
+			metricasNDVI.Min = minVals[i]
 		}
-		if maxVals[i] > metricas.NDVIMax {
-			metricas.NDVIMax = maxVals[i]
+		if maxVals[i] > metricasNDVI.Max {
+			metricasNDVI.Max = maxVals[i]
 		}
 		totalSum += sums[i]
 	}
 
-	metricas.NDVIPromedio = totalSum / float64(pixelCount)
-	metricas.TiempoNDVI = time.Since(inicioNDVI)
+	metricasNDVI.Promedio = totalSum / float64(pixelCount)
+	metricasNDVI.Tiempo = time.Since(inicioNDVI)
 
 	// Después de wgNDVI.Wait(), sumar los conteos de píxeles sin datos:
 	totalSinDatos := 0
 	for _, count := range pixelesSinDatos {
 		totalSinDatos += count
 	}
-	metricas.PixelesSinDatos = totalSinDatos
-
-	// Crear directorio si no existe
-	os.MkdirAll("./go_jp2_direct", 0755)
-
-	// Nombres de los archivos de salida
-	nombreGray := fmt.Sprintf("./go_jp2_direct/ndvi_%s_gray.png", resolucion)
-	nombreColor := fmt.Sprintf("./go_jp2_direct/ndvi_%s_color.png", resolucion)
-
-	// Crear imagen NDVI en escala de grises
-	ndviGrayImg := image.NewGray(image.Rect(0, 0, width, height))
-	grayPix := ndviGrayImg.Pix
-
-	// Acceso directo a buffer para optimizar escritura
-	for i, val := range ndviData {
-		// Normalizar NDVI de [-1,1] a [0,255]
-		grayPix[i] = uint8((val + 1) * 127.5)
-	}
+	metricasNDVI.PixelesSinDatos = totalSinDatos
 
 	// Procesar color en paralelo
 	inicioColor := time.Now()
@@ -404,56 +452,11 @@ func procesarNDVIMulti(archivoNIR, archivoRED, resolucion string, numCPUs int) (
 	}
 
 	wgColor.Wait()
-	metricas.TiempoColor = time.Since(inicioColor)
+	metricasColor.Tiempo = time.Since(inicioColor)
 
-	// Guardar imágenes en paralelo
-	inicioGuardado := time.Now()
-	errChan := make(chan error, 2)
+	metricasColor.TamanoImagen = int64(width * height * 4) // 4 bytes por pixel RGBA
 
-	// Guardar imagen gris
-	go func() {
-		grayFile, err := os.Create(nombreGray)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		defer grayFile.Close()
-		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
-		errChan <- encoder.Encode(grayFile, ndviGrayImg)
-	}()
-
-	// Guardar imagen color
-	go func() {
-		colorFile, err := os.Create(nombreColor)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		defer colorFile.Close()
-		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
-		errChan <- encoder.Encode(colorFile, ndviColorImg)
-	}()
-
-	// Verificar errores
-	var saveErr error
-	for range 2 {
-		if err := <-errChan; err != nil && saveErr == nil {
-			saveErr = err
-		}
-	}
-	close(errChan)
-
-	if saveErr != nil {
-		return nil, saveErr
-	}
-
-	metricas.TiempoGuardado = time.Since(inicioGuardado)
-	metricas.TiempoTotal = time.Since(inicioTotal)
-
-	// Calcular tamaño de la imagen en memoria (aproximado)
-	metricas.TamanoImagen = int64(width * height * 4) // 4 bytes por pixel RGBA
-
-	return metricas, nil
+	return metricasNDVI, metricasColor, ndviColorImg, nil
 }
 
 func imprimirTablaRendimiento(metricas []*Metricas) {
@@ -492,7 +495,7 @@ func imprimirTablaRendimiento(metricas []*Metricas) {
 			formatNumber(guardMag), guardUnit, formatNumber(porcGuardado),
 			formatNumber(totalMag), totalUnit, "100.0") // Total siempre es 100%
 	}
-	fmt.Println("└─────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┘")
+	fmt.Println("└─────────┴─────────┴────────┴───────────┴───────────┴──────────┴──────────┘")
 	fmt.Println()
 
 	// Desglose de Lectura de Imágenes
@@ -602,11 +605,52 @@ func main() {
 	for _, cores := range coresConfigs {
 		fmt.Printf("\nEjecutando benchmarks en modo multi-thread con %d cores...\n", cores)
 		for _, cfg := range configuraciones {
-			metrica, err := procesarNDVIMulti(cfg.NIR, cfg.RED, cfg.Resolucion, cores)
+			// 1. Leer imágenes
+			nirResultado, redResultado, tiempoLectura, err := leerImagenesCPU(cfg.NIR, cfg.RED, cores)
+
+			if err != nil {
+				fmt.Printf("Error leyendo imágenes %s (multi-%d): %v\n", cfg.Resolucion, cores, err)
+				continue
+			}
+
+			// 2. Procesar NDVI
+			metricasNDVI, metricasColor, ndviColorImg, err := procesarNDVIMulti(nirResultado, redResultado, cfg.Resolucion, cores)
 			if err != nil {
 				fmt.Printf("Error procesando %s (multi-%d): %v\n", cfg.Resolucion, cores, err)
 				continue
 			}
+
+			// Crear estructura de métricas
+			metrica := &Metricas{
+				Resolucion:       cfg.Resolucion,
+				TiempoLectura:    tiempoLectura,
+				TiempoArchivoNIR: nirResultado.Metricas.TiempoArchivo,
+				TiempoDecodifNIR: nirResultado.Metricas.TiempoDecodif,
+				TiempoArchivoRED: redResultado.Metricas.TiempoArchivo,
+				TiempoDecodifRED: redResultado.Metricas.TiempoDecodif,
+				NumTilesNIR:      nirResultado.Metricas.NumTiles,
+				NumTilesRED:      redResultado.Metricas.NumTiles,
+				TiempoNDVI:       metricasNDVI.Tiempo,
+				Pixeles:          metricasNDVI.PixelesTotales,
+				PixelesSinDatos:  metricasNDVI.PixelesSinDatos,
+				NDVIMin:          metricasNDVI.Min,
+				NDVIMax:          metricasNDVI.Max,
+				NDVIPromedio:     metricasNDVI.Promedio,
+				TiempoColor:      metricasColor.Tiempo,
+				TamanoImagen:     metricasColor.TamanoImagen,
+			}
+
+			// 3. Guardar imágenes
+			tiempoGuardado, err := guardarImagenes(ndviColorImg, cfg.Resolucion)
+			if err != nil {
+				fmt.Printf("Error guardando imágenes %s (multi-%d): %v\n", cfg.Resolucion, cores, err)
+				continue
+			}
+			metrica.TiempoGuardado = tiempoGuardado
+
+			// Actualizar el tiempo total incluyendo todas las fases
+			metrica.TiempoTotal = metrica.TiempoLectura + metrica.TiempoNDVI + metrica.TiempoColor + metrica.TiempoGuardado
+
 			metrica.Resolucion = fmt.Sprintf("%s-M%d", cfg.Resolucion, cores) // Indicador de modo multi con # de cores
 			metricas = append(metricas, metrica)
 		}
