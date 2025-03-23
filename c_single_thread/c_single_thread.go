@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -14,11 +15,15 @@ import (
 	"unsafe"
 )
 
+// #cgo LDFLAGS: -L/usr/local/cuda/lib64 -lcudart -lnvjpeg2k
 // #cgo CFLAGS: -I/home/linuxbrew/.linuxbrew/Cellar/openjpeg/2.5.3/include
 // #cgo LDFLAGS: -L/home/linuxbrew/.linuxbrew/Cellar/openjpeg/2.5.3/lib -lopenjp2
+// #include "nvjpeg2k.h"
+// #include <cuda_runtime.h>
 // #include <openjpeg-2.5/openjpeg.h>
 // #include <stdlib.h>
 // #include <string.h>
+// #include <stdint.h>
 //
 // // Callback functions for OpenJPEG
 // void error_callback(const char *msg, void *client_data) {
@@ -274,6 +279,207 @@ func readJP2Direct(filePath string, threads int) (*ResultadoBanda, error) {
 	return resultado, nil
 }
 
+// Después de la función readJP2Direct
+
+// readJP2DirectCUDA: Versión CUDA de readJP2Direct con la misma firma
+func readJP2DirectCUDA(filePath string, threads int) (*ResultadoBanda, error) {
+	resultado := &ResultadoBanda{
+		Metricas: MetricasLectura{},
+	}
+
+	inicioTotal := time.Now()
+
+	// Inicialización de CUDA y nvjpeg2k
+	var handle C.nvjpeg2kHandle_t
+	if status := C.nvjpeg2kCreateSimple(&handle); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("failed to create handle: %v", status)
+	}
+	defer C.nvjpeg2kDestroy(handle)
+
+	var stream C.nvjpeg2kStream_t
+	if status := C.nvjpeg2kStreamCreate(&stream); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("failed to create stream: %v", status)
+	}
+	defer C.nvjpeg2kStreamDestroy(stream)
+
+	// Parseo del archivo
+	inicioArchivo := time.Now()
+	cFilePath := C.CString(filePath)
+	defer C.free(unsafe.Pointer(cFilePath))
+
+	if status := C.nvjpeg2kStreamParseFile(handle, cFilePath, stream); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("failed to parse file: %v", status)
+	}
+
+	// Obtención de información de la imagen
+	var imageInfo C.nvjpeg2kImageInfo_t
+	if status := C.nvjpeg2kStreamGetImageInfo(stream, &imageInfo); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("failed to get image info: %v", status)
+	}
+
+	resultado.Metricas.TiempoArchivo = time.Since(inicioArchivo)
+
+	// Decodificación
+	inicioDecodif := time.Now()
+
+	numComponents := int(imageInfo.num_components)
+	var pixelType C.nvjpeg2kImageType_t
+
+	// Determinar tipo de píxel basado en el primer componente
+	var compInfo C.nvjpeg2kImageComponentInfo_t
+	if status := C.nvjpeg2kStreamGetImageComponentInfo(stream, &compInfo, 0); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("failed to get component info: %v", status)
+	}
+
+	switch {
+	case compInfo.precision <= 8 && compInfo.sgn == 0:
+		pixelType = C.NVJPEG2K_UINT8
+	case compInfo.precision <= 16 && compInfo.sgn == 0:
+		pixelType = C.NVJPEG2K_UINT16
+	case compInfo.precision <= 16 && compInfo.sgn != 0:
+		pixelType = C.NVJPEG2K_INT16
+	default:
+		return nil, errors.New("precisión/signo de componente no soportado")
+	}
+
+	// Configuración de parámetros de decodificación
+	var decodeParams C.nvjpeg2kDecodeParams_t
+	if status := C.nvjpeg2kDecodeParamsCreate(&decodeParams); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("failed to create decode params: %v", status)
+	}
+	defer C.nvjpeg2kDecodeParamsDestroy(decodeParams)
+
+	C.nvjpeg2kDecodeParamsSetOutputFormat(decodeParams, C.NVJPEG2K_FORMAT_PLANAR)
+
+	var decodeState C.nvjpeg2kDecodeState_t
+	if status := C.nvjpeg2kDecodeStateCreate(handle, &decodeState); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("failed to create decode state: %v", status)
+	}
+	defer C.nvjpeg2kDecodeStateDestroy(decodeState)
+
+	// Configuración de estructuras para la imagen de salida
+	outputImage := C.nvjpeg2kImage_t{
+		pixel_type:     pixelType,
+		num_components: C.uint32_t(numComponents),
+		pixel_data:     (*unsafe.Pointer)(C.malloc(C.size_t(numComponents) * C.size_t(unsafe.Sizeof(unsafe.Pointer(nil))))),
+		pitch_in_bytes: (*C.size_t)(C.malloc(C.size_t(numComponents) * C.size_t(unsafe.Sizeof(C.size_t(0))))),
+	}
+	defer C.free(unsafe.Pointer(outputImage.pixel_data))
+	defer C.free(unsafe.Pointer(outputImage.pitch_in_bytes))
+
+	// Array para guardar punteros a memoria en GPU
+	devicePtrs := make([]unsafe.Pointer, numComponents)
+	defer func() {
+		for _, ptr := range devicePtrs {
+			C.cudaFree(ptr)
+		}
+	}()
+
+	// Preparar memoria para cada componente
+	for i := 0; i < numComponents; i++ {
+		if status := C.nvjpeg2kStreamGetImageComponentInfo(stream, &compInfo, C.uint32_t(i)); status != C.NVJPEG2K_STATUS_SUCCESS {
+			return nil, fmt.Errorf("failed to get component info: %v", status)
+		}
+
+		bytesPerPixel := (int(compInfo.precision) + 7) / 8
+		size := int(compInfo.component_width) * int(compInfo.component_height) * bytesPerPixel
+
+		var devPtr unsafe.Pointer
+		if status := C.cudaMalloc(&devPtr, C.size_t(size)); status != C.cudaSuccess {
+			return nil, fmt.Errorf("cudaMalloc failed: %v", status)
+		}
+		devicePtrs[i] = devPtr
+
+		ptrArray := (*[1<<30 - 1]*C.uchar)(unsafe.Pointer(outputImage.pixel_data))[:numComponents:numComponents]
+		ptrArray[i] = (*C.uchar)(devPtr)
+
+		pitchArray := (*[1<<30 - 1]C.size_t)(unsafe.Pointer(outputImage.pitch_in_bytes))[:numComponents:numComponents]
+		pitchArray[i] = C.size_t(int(compInfo.component_width) * bytesPerPixel)
+	}
+
+	// Decodificar la imagen
+	if status := C.nvjpeg2kDecodeImage(handle, decodeState, stream, decodeParams, &outputImage, nil); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return nil, fmt.Errorf("decode failed: %v", status)
+	}
+
+	// Crear la estructura JP2Image para el resultado
+	jp2Image := &JP2Image{
+		Width:      int(imageInfo.image_width),
+		Height:     int(imageInfo.image_height),
+		Components: numComponents,
+		Data:       make([][]float32, numComponents),
+	}
+
+	// Transferir datos de GPU a CPU y convertir a float32
+	for i := 0; i < numComponents; i++ {
+		if status := C.nvjpeg2kStreamGetImageComponentInfo(stream, &compInfo, C.uint32_t(i)); status != C.NVJPEG2K_STATUS_SUCCESS {
+			return nil, fmt.Errorf("failed to get component info: %v", status)
+		}
+
+		width := int(compInfo.component_width)
+		height := int(compInfo.component_height)
+		precision := int(compInfo.precision)
+		isSigned := compInfo.sgn != 0
+		bytesPerPixel := (precision + 7) / 8
+		totalSize := width * height * bytesPerPixel
+
+		// Buffer para los datos crudos
+		rawData := make([]byte, totalSize)
+		dataPtr := (*[1<<30 - 1]*C.uchar)(unsafe.Pointer(outputImage.pixel_data))[i]
+
+		// Transferir de GPU a CPU
+		if status := C.cudaMemcpy(
+			unsafe.Pointer(&rawData[0]),
+			unsafe.Pointer(dataPtr),
+			C.size_t(totalSize),
+			C.cudaMemcpyDeviceToHost,
+		); status != C.cudaSuccess {
+			return nil, fmt.Errorf("cudaMemcpy failed: %v", status)
+		}
+
+		// Asignar memoria para los datos normalizados
+		jp2Image.Data[i] = make([]float32, width*height)
+
+		// Factor para normalizar según precisión
+		factor := float32(math.Pow(2, float64(precision)-1))
+
+		// Convertir según precisión
+		if precision <= 8 {
+			for j := 0; j < width*height && j < len(rawData); j++ {
+				if isSigned {
+					jp2Image.Data[i][j] = float32(int8(rawData[j])) / factor
+				} else {
+					jp2Image.Data[i][j] = float32(rawData[j]) / factor
+				}
+			}
+		} else if precision <= 16 {
+			for j := 0; j < width*height && j*2+1 < len(rawData); j++ {
+				value := uint16(rawData[j*2]) | (uint16(rawData[j*2+1]) << 8)
+				if isSigned {
+					jp2Image.Data[i][j] = float32(int16(value)) / factor
+				} else {
+					jp2Image.Data[i][j] = float32(value) / factor
+				}
+			}
+		}
+	}
+
+	resultado.Metricas.TiempoDecodif = time.Since(inicioDecodif)
+	resultado.Metricas.NumTiles = int(imageInfo.num_tiles_x * imageInfo.num_tiles_y)
+	resultado.Metricas.TiempoTotal = time.Since(inicioTotal)
+	resultado.Imagen = jp2Image
+
+	return resultado, nil
+}
+
+// readJP2 selecciona entre implementación CPU o CUDA
+func readJP2(filePath string, threads int, useCUDA bool) (*ResultadoBanda, error) {
+	if useCUDA {
+		return readJP2DirectCUDA(filePath, threads)
+	}
+	return readJP2Direct(filePath, threads)
+}
+
 // leerImagenes: Simplificar la firma devolviendo las imágenes y sus métricas agrupadas
 func leerImagenesCPU(archivoNIR, archivoRED string, numCPUs int) (*ResultadoBanda, *ResultadoBanda, time.Duration, error) {
 	inicioLectura := time.Now()
@@ -488,12 +694,12 @@ func imprimirTablaRendimiento(metricas []*Metricas) {
 
 		fmt.Printf("│ %-7s │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │\n",
 			m.Resolucion,
-			formatNumber(nirMag), nirUnit, formatNumber(porcNIR),
-			formatNumber(redMag), redUnit, formatNumber(porcRED),
-			formatNumber(ndviMag), ndviUnit, formatNumber(porcNDVI),
-			formatNumber(colorMag), colorUnit, formatNumber(porcColor),
-			formatNumber(guardMag), guardUnit, formatNumber(porcGuardado),
-			formatNumber(totalMag), totalUnit, "100.0") // Total siempre es 100%
+			formatNumber(nirMag, 5), nirUnit, formatNumber(porcNIR, 5),
+			formatNumber(redMag, 5), redUnit, formatNumber(porcRED, 5),
+			formatNumber(ndviMag, 5), ndviUnit, formatNumber(porcNDVI, 5),
+			formatNumber(colorMag, 5), colorUnit, formatNumber(porcColor, 5),
+			formatNumber(guardMag, 5), guardUnit, formatNumber(porcGuardado, 5),
+			formatNumber(totalMag, 5), totalUnit, "100.0") // Total siempre es 100%
 	}
 	fmt.Println("└─────────┴─────────┴────────┴───────────┴───────────┴──────────┴──────────┘")
 	fmt.Println()
@@ -534,11 +740,11 @@ func imprimirTablaRendimiento(metricas []*Metricas) {
 
 		fmt.Printf("│ %-7s │ %s%-2s │ %s%% │ %-3d tiles │ %-3d tiles │ %s %-2s │ %s MB │\n",
 			m.Resolucion,
-			formatNumber(pixelesSinDatosMP), "MP", formatNumber(porcNoData), // Ahora muestra MP de región sin cobertura
+			formatNumber(pixelesSinDatosMP, 5), "MP", formatNumber(porcNoData, 5), // Ahora muestra MP de región sin cobertura
 			m.NumTilesNIR,
 			m.NumTilesRED,
-			formatNumber(totalPixValor), totalPixUnidad,
-			formatNumber(tamanoMB),
+			formatNumber(totalPixValor, 5), totalPixUnidad,
+			formatNumber(tamanoMB, 5),
 		)
 	}
 	fmt.Println("└─────────┴─────────┴────────┴───────────┴───────────┴──────────┴──────────┘")
@@ -557,23 +763,26 @@ func getMagnitudeAndUnit(d time.Duration) (float64, string) {
 	}
 }
 
-func formatNumber(num float64) string {
+func formatNumber(num float64, desiredLength int) string {
 	integerPart := int(math.Floor(math.Abs(num)))
 	integerLength := len(strconv.Itoa(integerPart))
 
-	var precision int
-	switch integerLength {
-	case 3:
-		precision = 1
-	case 2:
-		precision = 2
-	case 1:
-		precision = 3
-	default:
-		// Manejar otros casos si es necesario
-		return fmt.Sprintf("%g", num) // Formato general
+	// Calculate how many decimal places we can show
+	// We reserve 1 spot for decimal point if needed
+	precision := 0
+	if integerLength < desiredLength {
+		precision = desiredLength - integerLength
+		if precision > 0 {
+			precision-- // Account for decimal point
+		}
 	}
-	return fmt.Sprintf("%.*f", precision, num)
+
+	// Format with calculated precision
+	if precision > 0 {
+		return fmt.Sprintf("%.*f", precision, num)
+	} else {
+		return fmt.Sprintf("%d", integerPart)
+	}
 }
 
 func main() {
@@ -583,12 +792,12 @@ func main() {
 		RED        string
 		Resolucion string
 	}{
-		{"../input_images/B08_10m.jp2", "../input_images/B04_10m.jp2", "10m"},
-		{"../input_images/B08_20m.jp2", "../input_images/B04_20m.jp2", "20m"},
-		{"../input_images/B08_60m.jp2", "../input_images/B04_60m.jp2", "60m"},
-		{"../input_images_2/B08_10m.jp2", "../input_images_2/B04_10m.jp2", "10m"},
-		{"../input_images_2/B08_20m.jp2", "../input_images_2/B04_20m.jp2", "20m"},
-		{"../input_images_2/B08_60m.jp2", "../input_images_2/B04_60m.jp2", "60m"},
+		{"../input_images/COMPLETE_B08_10m.jp2", "../input_images/COMPLETE_B04_10m.jp2", "10m"},
+		{"../input_images/COMPLETE_B08_20m.jp2", "../input_images/COMPLETE_B04_20m.jp2", "20m"},
+		{"../input_images/COMPLETE_B08_60m.jp2", "../input_images/COMPLETE_B04_60m.jp2", "60m"},
+		{"../input_images/INCOMPLETE_B08_10m.jp2", "../input_images/INCOMPLETE_B04_10m.jp2", "10m"},
+		{"../input_images/INCOMPLETE_B08_20m.jp2", "../input_images/INCOMPLETE_B04_20m.jp2", "20m"},
+		{"../input_images/INCOMPLETE_B08_60m.jp2", "../input_images/INCOMPLETE_B04_60m.jp2", "60m"},
 	}
 
 	// Get CPU count
