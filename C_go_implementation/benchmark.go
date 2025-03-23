@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -849,27 +850,94 @@ func ProcessNDVI(nirPath, redPath, outputPath string, useGPU bool, threads int) 
 	return metrica, nil
 }
 
+// AgregarMetricas suma los valores de dos métricas
+// Se utiliza para acumular métricas en ejecuciones múltiples
+func AgregarMetricas(acumulado, nuevo *Metricas) {
+	acumulado.TiempoTotal += nuevo.TiempoTotal
+	acumulado.TiempoLectura += nuevo.TiempoLectura
+	acumulado.TiempoNDVI += nuevo.TiempoNDVI
+	acumulado.TiempoColor += nuevo.TiempoColor
+	acumulado.TiempoGuardado += nuevo.TiempoGuardado
+	acumulado.TiempoArchivoNIR += nuevo.TiempoArchivoNIR
+	acumulado.TiempoDecodifNIR += nuevo.TiempoDecodifNIR
+	acumulado.TiempoArchivoRED += nuevo.TiempoArchivoRED
+	acumulado.TiempoDecodifRED += nuevo.TiempoDecodifRED
+	acumulado.PixelesSinDatos += nuevo.PixelesSinDatos
+	acumulado.NDVIMin = math.Min(acumulado.NDVIMin, nuevo.NDVIMin)
+	acumulado.NDVIMax = math.Max(acumulado.NDVIMax, nuevo.NDVIMax)
+	acumulado.NDVIPromedio += nuevo.NDVIPromedio
+}
+
+// PromediarMetricas calcula el promedio de las métricas acumuladas
+func PromediarMetricas(acumulado *Metricas, numEjecuciones int) *Metricas {
+	resultado := *acumulado // Copia todos los valores
+
+	// Dividimos los tiempos entre el número de ejecuciones
+	resultado.TiempoTotal /= time.Duration(numEjecuciones)
+	resultado.TiempoLectura /= time.Duration(numEjecuciones)
+	resultado.TiempoNDVI /= time.Duration(numEjecuciones)
+	resultado.TiempoColor /= time.Duration(numEjecuciones)
+	resultado.TiempoGuardado /= time.Duration(numEjecuciones)
+	resultado.TiempoArchivoNIR /= time.Duration(numEjecuciones)
+	resultado.TiempoDecodifNIR /= time.Duration(numEjecuciones)
+	resultado.TiempoArchivoRED /= time.Duration(numEjecuciones)
+	resultado.TiempoDecodifRED /= time.Duration(numEjecuciones)
+
+	// Promediamos valores numéricos
+	resultado.PixelesSinDatos /= numEjecuciones
+	resultado.NDVIPromedio /= float64(numEjecuciones)
+
+	// Min/Max y otros valores estáticos se mantienen igual
+
+	return &resultado
+}
+
+// CopiarMetricas crea una copia de las métricas
+func CopiarMetricas(m *Metricas) *Metricas {
+	copia := *m // Copia todos los campos
+	return &copia
+}
+
+// InicializarMetricasAcumuladas crea una estructura inicial para acumular métricas
+func InicializarMetricasAcumuladas(original *Metricas) *Metricas {
+	acumulado := CopiarMetricas(original)
+	acumulado.NDVIMin = math.MaxFloat64  // Para permitir encontrar el mínimo real
+	acumulado.NDVIMax = -math.MaxFloat64 // Para permitir encontrar el máximo real
+	return acumulado
+}
+
 func main() {
+	// Parámetro para número de repeticiones
+	numRepeticiones := flag.Int("reps", 3, "Número de repeticiones del benchmark")
+	flag.Parse()
+
+	if *numRepeticiones < 1 {
+		fmt.Println("El número de repeticiones debe ser al menos 1")
+		*numRepeticiones = 1
+	}
+
+	fmt.Printf("Ejecutando benchmark con %d repeticiones\n", *numRepeticiones)
+
 	// Definir configuraciones a procesar
 	configuraciones := []struct {
 		NIR        string
 		RED        string
 		Resolucion string
 	}{
-		{"../input_images/COMPLETE_B08_10m.jp2", "../input_images/COMPLETE_B04_10m.jp2", "10m"},
-		{"../input_images/COMPLETE_B08_20m.jp2", "../input_images/COMPLETE_B04_20m.jp2", "20m"},
+		//{"../input_images/COMPLETE_B08_10m.jp2", "../input_images/COMPLETE_B04_10m.jp2", "10m"},
+		//{"../input_images/COMPLETE_B08_20m.jp2", "../input_images/COMPLETE_B04_20m.jp2", "20m"},
 		{"../input_images/COMPLETE_B08_60m.jp2", "../input_images/COMPLETE_B04_60m.jp2", "60m"},
 	}
 
 	// Definir los diferentes números de núcleos a probar
-	nucleosAProbar := []int{1, 2, 4, 6, 8, 10, 12, 14, 16}
+	nucleosAProbar := []int{1, 2, 4, 8, 12, 16}
 
 	// Obtener número máximo de CPUs disponibles
 	maxCPUs := runtime.NumCPU()
 	fmt.Printf("CPUs disponibles: %d\n\n", maxCPUs)
 
 	// Almacenar métricas para cada resolución y configuración de núcleos
-	metricas := make([]*Metricas, 0, len(configuraciones)*(len(nucleosAProbar)+1)) // +1 para GPU
+	metricasPromedio := make([]*Metricas, 0, len(configuraciones)*(len(nucleosAProbar)+1)) // +1 para GPU
 
 	for _, cfg := range configuraciones {
 		fmt.Printf("=== Procesando resolución %s ===\n", cfg.Resolucion)
@@ -884,50 +952,102 @@ func main() {
 			}
 
 			fmt.Printf("\n>> Modo CPU (%d núcleos)\n", numNucleos)
-			metricaCPU, err := ProcessNDVI(
-				cfg.NIR,
-				cfg.RED,
-				cfg.Resolucion,
-				false, // useGPU = false
-				numNucleos,
-			)
-			if err != nil {
+
+			var metricasAcumuladas *Metricas
+			var errAcumulado error
+
+			// Ejecutar el benchmark múltiples veces
+			for i := 1; i <= *numRepeticiones; i++ {
+				fmt.Printf("  Ejecución %d/%d... ", i, *numRepeticiones)
+
+				metricaCPU, err := ProcessNDVI(
+					cfg.NIR,
+					cfg.RED,
+					cfg.Resolucion,
+					false, // useGPU = false
+					numNucleos,
+				)
+
+				if err != nil {
+					fmt.Printf("Error: %v\n", err)
+					errAcumulado = err
+					continue
+				}
+
+				fmt.Printf("Completado en %v\n", metricaCPU.TiempoTotal)
+
+				if metricasAcumuladas == nil {
+					metricasAcumuladas = InicializarMetricasAcumuladas(metricaCPU)
+				} else {
+					AgregarMetricas(metricasAcumuladas, metricaCPU)
+				}
+			}
+
+			if metricasAcumuladas != nil {
+				metricaPromedio := PromediarMetricas(metricasAcumuladas, *numRepeticiones)
+				metricasPromedio = append(metricasPromedio, metricaPromedio)
+				fmt.Printf("  Tiempo promedio: %v\n", metricaPromedio.TiempoTotal)
+			} else if errAcumulado != nil {
 				fmt.Printf("Error procesando %s con %d CPUs: %v\n",
-					cfg.Resolucion, numNucleos, err)
-			} else {
-				metricas = append(metricas, metricaCPU)
+					cfg.Resolucion, numNucleos, errAcumulado)
 			}
 		}
 
 		// Procesar con GPU si está disponible
 		fmt.Printf("\n>> Modo GPU\n")
-		metricaGPU, err := ProcessNDVI(
-			cfg.NIR,
-			cfg.RED,
-			cfg.Resolucion,
-			true, // useGPU = true
-			1,    // threads no se usa en GPU
-		)
-		if err != nil {
-			fmt.Printf("Error procesando %s con GPU: %v\n", cfg.Resolucion, err)
+
+		var metricasAcumuladasGPU *Metricas
+		var errAcumuladoGPU error
+
+		// Ejecutar el benchmark múltiples veces para GPU
+		for i := 1; i <= *numRepeticiones; i++ {
+			fmt.Printf("  Ejecución %d/%d... ", i, *numRepeticiones)
+
+			metricaGPU, err := ProcessNDVI(
+				cfg.NIR,
+				cfg.RED,
+				cfg.Resolucion,
+				true, // useGPU = true
+				1,    // threads no se usa en GPU
+			)
+
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				errAcumuladoGPU = err
+				continue
+			}
+
+			fmt.Printf("Completado en %v\n", metricaGPU.TiempoTotal)
+
+			if metricasAcumuladasGPU == nil {
+				metricasAcumuladasGPU = InicializarMetricasAcumuladas(metricaGPU)
+			} else {
+				AgregarMetricas(metricasAcumuladasGPU, metricaGPU)
+			}
+		}
+
+		if metricasAcumuladasGPU != nil {
+			metricaPromedioGPU := PromediarMetricas(metricasAcumuladasGPU, *numRepeticiones)
+			metricasPromedio = append(metricasPromedio, metricaPromedioGPU)
+			fmt.Printf("  Tiempo promedio: %v\n", metricaPromedioGPU.TiempoTotal)
+		} else if errAcumuladoGPU != nil {
+			fmt.Printf("Error procesando %s con GPU: %v\n", cfg.Resolucion, errAcumuladoGPU)
 			fmt.Printf("¿Está disponible la GPU con soporte CUDA y nvJPEG2000?\n")
-		} else {
-			metricas = append(metricas, metricaGPU)
 		}
 
 		fmt.Println("\n-----------------------------------")
 	}
 
 	// Imprimir tabla de métricas
-	if len(metricas) > 0 {
-		fmt.Println("\n--- RESULTADOS DEL BENCHMARK ---")
-		PrintMetricsTable(metricas)
+	if len(metricasPromedio) > 0 {
+		fmt.Printf("\n--- RESULTADOS DEL BENCHMARK (Promedio de %d ejecuciones) ---\n", *numRepeticiones)
+		PrintMetricsTable(metricasPromedio)
 
 		// También generar un resumen de escalabilidad para cada resolución
 		fmt.Println("\n--- ANÁLISIS DE ESCALABILIDAD ---")
 		for _, cfg := range configuraciones {
 			metricasPorResolucion := make(map[string][]*Metricas)
-			for _, m := range metricas {
+			for _, m := range metricasPromedio {
 				// Extraer la resolución base (sin sufijo _cpu_XXc o _gpu)
 				baseRes := strings.SplitN(m.Resolucion, "_", 2)[0]
 				if baseRes == cfg.Resolucion {
