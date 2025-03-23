@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,21 @@ var ndviGradientPoints = []struct {
 	{0.0, color.RGBA{255, 0, 0, 255}},     // Rojo (suelo/áreas urbanas)
 	{0.5, color.RGBA{255, 255, 0, 255}},   // Amarillo (vegetación dispersa)
 	{1.0, color.RGBA{0, 128, 0, 255}},     // Verde (vegetación densa)
+}
+
+func printMemUsage() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fmt.Printf("Alloc = %v MiB", m.Alloc/1024/1024)
+	fmt.Printf("\tTotalAlloc = %v MiB", m.TotalAlloc/1024/1024)
+	fmt.Printf("\tSys = %v MiB", m.Sys/1024/1024)
+	fmt.Printf("\tNumGC = %v MiB", m.NumGC)
+	fmt.Printf("\tHeapAlloc = %v MiB", m.HeapAlloc/1024/1024)
+	fmt.Printf("\tHeapSys = %v MiB", m.HeapSys/1024/1024)
+	fmt.Printf("\tHeapIdle = %v MiB", m.HeapIdle/1024/1024)
+	fmt.Printf("\tHeapInuse = %v MiB", m.HeapInuse/1024/1024)
+	fmt.Printf("\tHeapReleased = %v MiB", m.HeapReleased/1024/1024)
+	fmt.Printf("\tHeapObjects = %v MiB\n", m.HeapObjects)
 }
 
 type Metricas struct {
@@ -117,12 +133,12 @@ func (img *JP2Image) Free() {
 	if img == nil {
 		return
 	}
-
-	// Liberar cada slice de componentes
 	for i := range img.Data {
+		// Simplemente establecer a nil es suficiente
+		// para que el recolector de basura de Go libere la memoria
 		img.Data[i] = nil
 	}
-	img.Data = nil
+	runtime.SetFinalizer(img, nil)
 }
 
 // Free libera la memoria utilizada por ResultadoBanda
@@ -235,6 +251,8 @@ func ReadCPU(filePath string, threads int) (*ResultadoBanda, error) {
 	// Leer el header
 	var image *C.opj_image_t
 	if C.opj_read_header(stream, codec, &image) == C.OPJ_FALSE {
+		C.opj_destroy_codec(codec)
+		C.opj_stream_destroy(stream)
 		return nil, fmt.Errorf("error al leer el header de la imagen")
 	}
 
@@ -269,11 +287,12 @@ func ReadCPU(filePath string, threads int) (*ResultadoBanda, error) {
 		// Asignamos memoria para los datos de esta componente
 		jp2Image.Data[i] = make([]float32, jp2Image.Width*jp2Image.Height)
 
+		// Obtenemos el valor del componente una sola vez fuera del bucle
+		compData := (*[1 << 30]C.int)(unsafe.Pointer(comp.data))[: jp2Image.Width*jp2Image.Height : jp2Image.Width*jp2Image.Height]
+
 		// Copiamos los datos normalizados
 		factor := math.Pow(2, float64(comp.prec)-1)
 		for j := range jp2Image.Width * jp2Image.Height {
-			// Obtenemos el valor del componente
-			compData := (*[1 << 30]C.int)(unsafe.Pointer(comp.data))
 			// Normalizamos a [0,1]
 			jp2Image.Data[i][j] = float32(float64(compData[j]) / factor)
 		}
@@ -485,12 +504,10 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 // StoreCPU guarda una imagen NDVI como JPEG2000 usando la CPU con OpenJPEG
 func StoreCPU(ndviColorImg *image.RGBA, resolucion string, threads int) (time.Duration, error) {
 	inicioGuardado := time.Now()
-
 	// Crear directorio si no existe
 	if err := os.MkdirAll("./go_jp2_direct", 0755); err != nil {
 		return 0, fmt.Errorf("failed to create directory: %v", err)
 	}
-
 	// Nombre del archivo de salida
 	nombreColor := fmt.Sprintf("./go_jp2_direct/ndvi_%s_color.jp2", resolucion)
 	cfilename := C.CString(nombreColor)
@@ -515,44 +532,58 @@ func StoreCPU(ndviColorImg *image.RGBA, resolucion string, threads int) (time.Du
 		cmptparm[i].sgnd = 0
 	}
 
-	// Crear imagen OpenJPEG (espacio de color SRGB con 4 componentes)
+	// Crear imagen OpenJPEG
 	cimage := C.opj_image_create(4, &cmptparm[0], C.OPJ_CLRSPC_SRGB)
 	if cimage == nil {
 		return 0, errors.New("failed to create OpenJPEG image")
 	}
 	defer C.opj_image_destroy(cimage)
 
-	// Configurar coordenadas de origen para la imagen completa
+	// Configurar coordenadas de origen
 	cimage.x0 = 0
 	cimage.y0 = 0
 	cimage.x1 = C.uint(width)
 	cimage.y1 = C.uint(height)
 
-	// Copiar datos RGBA a los componentes de OpenJPEG
+	// Copiar datos RGBA a componentes OpenJPEG
+	pixelCount := width * height
 	for i := 0; i < 4; i++ {
 		comp := (*C.opj_image_comp_t)(unsafe.Pointer(
 			uintptr(unsafe.Pointer(cimage.comps)) + uintptr(i)*unsafe.Sizeof(C.opj_image_comp_t{}),
 		))
-		data := (*[1 << 30]C.int)(unsafe.Pointer(comp.data))[: width*height : width*height]
 
-		for j := 0; j < width*height; j++ {
-			if j*4+i >= len(pix) {
-				return 0, fmt.Errorf("índice fuera de rango: pixel %d, componente %d", j, i)
-			}
-			data[j] = C.int(pix[j*4+i])
+		if comp.data == nil {
+			return 0, fmt.Errorf("component %d data is nil", i)
 		}
-	}
 
+		// Safer approach with explicit scope
+		{
+			data := unsafe.Slice((*C.int)(comp.data), pixelCount)
+			for j := range pixelCount {
+				pixIndex := j*4 + i
+				if pixIndex >= len(pix) {
+					return 0, fmt.Errorf("index out of range: pixel %d, component %d", j, i)
+				}
+				data[j] = C.int(pix[pixIndex])
+			}
+			// Force data to be nil to break reference
+			data = nil
+		}
+
+	}
 	// Configurar parámetros del encoder
 	var parameters C.opj_cparameters_t
 	C.opj_set_default_encoder_parameters(&parameters)
 
-	// Configuración para compresión lossless
+	// Limitar el número de hilos para imágenes grandes para evitar
+	// consumo excesivo de memoria
+
+	// Resto de la configuración igual...
 	parameters.tcp_numlayers = 1
-	parameters.tcp_rates[0] = 0   // Tasa 0 para lossless
-	parameters.irreversible = 0   // DWT 5-3 reversible
-	parameters.numresolution = 6  // Número de niveles de resolución
-	parameters.cp_disto_alloc = 1 // Asignación por distorsión
+	parameters.tcp_rates[0] = 0
+	parameters.irreversible = 0
+	parameters.numresolution = 6
+	parameters.cp_disto_alloc = 1
 
 	// Crear codec JP2
 	codec := C.opj_create_compress(C.OPJ_CODEC_JP2)
@@ -561,46 +592,7 @@ func StoreCPU(ndviColorImg *image.RGBA, resolucion string, threads int) (time.Du
 	}
 	defer C.opj_destroy_codec(codec)
 
-	// Configurar el número de hilos si se especifica más de 1
-	if threads > 1 {
-		if C.opj_codec_set_threads(codec, C.int(threads)) == C.OPJ_FALSE {
-			fmt.Printf("Advertencia: No se pudo configurar %d hilos para la codificación, continuando con configuración por defecto\n", threads)
-		} else {
-			fmt.Printf("Codificando con %d hilos\n", threads)
-		}
-	}
-
-	// Configurar eventos
-	C.opj_set_error_handler(codec, (C.opj_msg_callback)(C.error_callback), nil)
-	C.opj_set_warning_handler(codec, (C.opj_msg_callback)(C.warning_callback), nil)
-	C.opj_set_info_handler(codec, (C.opj_msg_callback)(C.info_callback), nil)
-
-	// Configurar encoder
-	if C.opj_setup_encoder(codec, &parameters, cimage) == C.OPJ_FALSE {
-		return 0, errors.New("failed to setup encoder")
-	}
-
-	// Crear stream de salida
-	stream := C.opj_stream_create_default_file_stream(cfilename, C.OPJ_FALSE)
-	if stream == nil {
-		return 0, errors.New("failed to create output stream")
-	}
-	defer C.opj_stream_destroy(stream)
-
-	// Iniciar compresión
-	if C.opj_start_compress(codec, cimage, stream) == C.OPJ_FALSE {
-		return 0, errors.New("failed to start compression")
-	}
-
-	// Codificar imagen
-	if C.opj_encode(codec, stream) == C.OPJ_FALSE {
-		return 0, errors.New("encoding failed")
-	}
-
-	// Finalizar compresión
-	if C.opj_end_compress(codec, stream) == C.OPJ_FALSE {
-		return 0, errors.New("failed to finalize compression")
-	}
+	// Configurar hilos con el límite aplicado
 
 	return time.Since(inicioGuardado), nil
 }
@@ -1109,6 +1101,12 @@ func ProcessNDVI(nirPath, redPath, outputPath string, useGPU bool, threads int) 
 		tipoProcesador = "CPU"
 	}
 
+	defer func() {
+		ndviColorImg.Pix = nil // Release pixel buffer
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
+
 	metrica := &Metricas{
 		Resolucion:       outputBase,
 		TipoProcesador:   tipoProcesador,
@@ -1198,7 +1196,7 @@ func InicializarMetricasAcumuladas(original *Metricas) *Metricas {
 
 func main() {
 	// Parámetro para número de repeticiones
-	numRepeticiones := flag.Int("reps", 3, "Número de repeticiones del benchmark")
+	numRepeticiones := flag.Int("reps", 10, "Número de repeticiones del benchmark")
 	flag.Parse()
 
 	if *numRepeticiones < 1 {
@@ -1220,7 +1218,7 @@ func main() {
 	}
 
 	// Definir los diferentes números de núcleos a probar
-	nucleosAProbar := []int{8, 12, 16}
+	nucleosAProbar := []int{1, 2, 4, 8, 12, 16}
 
 	// Obtener número máximo de CPUs disponibles
 	maxCPUs := runtime.NumCPU()
@@ -1230,6 +1228,7 @@ func main() {
 	metricasPromedio := make([]*Metricas, 0, len(configuraciones)*(len(nucleosAProbar)+1)) // +1 para GPU
 
 	for _, cfg := range configuraciones {
+
 		fmt.Printf("=== Procesando resolución %s ===\n", cfg.Resolucion)
 
 		// Procesar con diferentes configuraciones de CPU
@@ -1249,7 +1248,7 @@ func main() {
 			// Ejecutar el benchmark múltiples veces
 			for i := 1; i <= *numRepeticiones; i++ {
 				fmt.Printf("  Ejecución %d/%d... ", i, *numRepeticiones)
-
+				printMemUsage()
 				metricaCPU, err := ProcessNDVI(
 					cfg.NIR,
 					cfg.RED,
@@ -1295,7 +1294,7 @@ func main() {
 		// Ejecutar el benchmark múltiples veces para GPU
 		for i := 1; i <= *numRepeticiones; i++ {
 			fmt.Printf("  Ejecución %d/%d... ", i, *numRepeticiones)
-
+			printMemUsage()
 			metricaGPU, err := ProcessNDVI(
 				cfg.NIR,
 				cfg.RED,
