@@ -58,28 +58,26 @@ type Metricas struct {
 	TiempoNDVI       time.Duration
 	TiempoColor      time.Duration
 	TiempoGuardado   time.Duration
-	TiempoArchivo    time.Duration
-	TiempoDecodif    time.Duration
-	TiempoArchivoNIR time.Duration // Nuevo campo
-	TiempoArchivoRED time.Duration // Nuevo campo
-	TiempoDecodifNIR time.Duration // Nuevo campo
-	TiempoDecodifRED time.Duration // Nuevo campo
+	TiempoArchivoNIR time.Duration
+	TiempoDecodifNIR time.Duration
+	TiempoArchivoRED time.Duration
+	TiempoDecodifRED time.Duration
 	Pixeles          int
-	PixelesSinDatos  int // Nuevo campo
+	PixelesSinDatos  int
 	TamanoImagen     int64
 	NDVIMin          float64
 	NDVIMax          float64
 	NDVIPromedio     float64
-	NumTilesNIR      int // Nuevo campo
-	NumTilesRED      int // Nuevo campo
+	NumTilesNIR      int
+	NumTilesRED      int
 }
 
 // MetricasLectura contiene las métricas asociadas a la lectura de un archivo JP2
 type MetricasLectura struct {
-	TiempoArchivo time.Duration // Tiempo de apertura del archivo
-	TiempoDecodif time.Duration // Tiempo de decodificación
-	NumTiles      int           // Número de tiles en la imagen
-	TiempoTotal   time.Duration // Tiempo total de lectura
+	TiempoArchivo time.Duration
+	TiempoDecodif time.Duration
+	NumTiles      int
+	TiempoTotal   time.Duration
 }
 
 // ResultadoBanda contiene una imagen JP2 y sus métricas de lectura
@@ -102,22 +100,6 @@ type MetricasNDVI struct {
 type MetricasColor struct {
 	Tiempo       time.Duration
 	TamanoImagen int64
-}
-
-// MetricasGuardado contiene las métricas del proceso de guardado
-type MetricasGuardado struct {
-	Tiempo time.Duration
-}
-
-// MetricasProcesoCompleto agrupa todas las métricas del proceso
-type MetricasProcesoCompleto struct {
-	Resolucion  string
-	NIR         MetricasLectura
-	RED         MetricasLectura
-	NDVI        MetricasNDVI
-	Color       MetricasColor
-	Guardado    MetricasGuardado
-	TiempoTotal time.Duration
 }
 
 // JP2Image representa una imagen JPEG2000 decodificada
@@ -165,8 +147,8 @@ func ndviColorOptimized(ndviValue float64) color.RGBA {
 	return color.RGBA{r, g, b, 255}
 }
 
-// readJP2Direct: Simplificar la firma devolviendo una estructura ResultadoBanda
-func readJP2Direct(filePath string, threads int) (*ResultadoBanda, error) {
+// ReadCPU lee una imagen JP2 usando la CPU
+func ReadCPU(filePath string, threads int) (*ResultadoBanda, error) {
 	resultado := &ResultadoBanda{
 		Metricas: MetricasLectura{},
 	}
@@ -279,10 +261,8 @@ func readJP2Direct(filePath string, threads int) (*ResultadoBanda, error) {
 	return resultado, nil
 }
 
-// Después de la función readJP2Direct
-
-// readJP2DirectCUDA: Versión CUDA de readJP2Direct con la misma firma
-func readJP2DirectCUDA(filePath string, threads int) (*ResultadoBanda, error) {
+// ReadGPU lee una imagen JP2 usando la GPU
+func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 	resultado := &ResultadoBanda{
 		Metricas: MetricasLectura{},
 	}
@@ -376,7 +356,7 @@ func readJP2DirectCUDA(filePath string, threads int) (*ResultadoBanda, error) {
 	}()
 
 	// Preparar memoria para cada componente
-	for i := 0; i < numComponents; i++ {
+	for i := range numComponents {
 		if status := C.nvjpeg2kStreamGetImageComponentInfo(stream, &compInfo, C.uint32_t(i)); status != C.NVJPEG2K_STATUS_SUCCESS {
 			return nil, fmt.Errorf("failed to get component info: %v", status)
 		}
@@ -472,43 +452,14 @@ func readJP2DirectCUDA(filePath string, threads int) (*ResultadoBanda, error) {
 	return resultado, nil
 }
 
-// readJP2 selecciona entre implementación CPU o CUDA
-func readJP2(filePath string, threads int, useCUDA bool) (*ResultadoBanda, error) {
-	if useCUDA {
-		return readJP2DirectCUDA(filePath, threads)
-	}
-	return readJP2Direct(filePath, threads)
-}
-
-// leerImagenes: Simplificar la firma devolviendo las imágenes y sus métricas agrupadas
-func leerImagenesCPU(archivoNIR, archivoRED string, numCPUs int) (*ResultadoBanda, *ResultadoBanda, time.Duration, error) {
-	inicioLectura := time.Now()
-
-	// Leer NIR
-	nirResultado, err := readJP2Direct(archivoNIR, numCPUs)
-	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error al leer NIR: %v", err)
-	}
-
-	// Leer RED
-	redResultado, err := readJP2Direct(archivoRED, numCPUs)
-	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error al leer RED: %v", err)
-	}
-
-	tiempoTotal := time.Since(inicioLectura)
-
-	return nirResultado, redResultado, tiempoTotal, nil
-}
-
-// guardarImagenes guarda las imágenes de NDVI en formato PNG
-func guardarImagenes(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error) {
+// StoreCPU guarda una imagen NDVI como PNG
+func StoreCPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error) {
 	inicioGuardado := time.Now()
 
 	// Crear directorio si no existe
 	os.MkdirAll("./go_jp2_direct", 0755)
 
-	// Nombre del archivo de salida (solo color)
+	// Nombre del archivo de salida
 	nombreColor := fmt.Sprintf("./go_jp2_direct/ndvi_%s_color.png", resolucion)
 
 	// Guardar solo la imagen color
@@ -526,8 +477,8 @@ func guardarImagenes(ndviColorImg *image.RGBA, resolucion string) (time.Duration
 	return tiempoGuardado, err
 }
 
-// procesarNDVIMulti: Simplificar para devolver métricas NDVI y color agrupadas
-func procesarNDVIMulti(nirResultado, redResultado *ResultadoBanda, resolucion string, numCPUs int) (*MetricasNDVI, *MetricasColor, *image.RGBA, error) {
+// CalculateNDVI calcula el índice NDVI y genera una imagen colorizada
+func CalculateNDVI(nirResultado, redResultado *ResultadoBanda, numCPUs int) (*MetricasNDVI, *MetricasColor, *image.RGBA, error) {
 	metricasNDVI := &MetricasNDVI{
 		Min: math.MaxFloat64,
 		Max: -math.MaxFloat64,
@@ -625,7 +576,7 @@ func procesarNDVIMulti(nirResultado, redResultado *ResultadoBanda, resolucion st
 	metricasNDVI.Promedio = totalSum / float64(pixelCount)
 	metricasNDVI.Tiempo = time.Since(inicioNDVI)
 
-	// Después de wgNDVI.Wait(), sumar los conteos de píxeles sin datos:
+	// Contabilizar píxeles sin datos
 	totalSinDatos := 0
 	for _, count := range pixelesSinDatos {
 		totalSinDatos += count
@@ -665,7 +616,8 @@ func procesarNDVIMulti(nirResultado, redResultado *ResultadoBanda, resolucion st
 	return metricasNDVI, metricasColor, ndviColorImg, nil
 }
 
-func imprimirTablaRendimiento(metricas []*Metricas) {
+// PrintMetricsTable imprime una tabla con las métricas de rendimiento
+func PrintMetricsTable(metricas []*Metricas) {
 	// Análisis de Cuellos de Botella
 	fmt.Println("┌ Análisis de Cuellos de Botella ───────────────┬──────────────────┬──────────────────┬──────────────────┬──────────────────┐")
 	fmt.Printf("│ %-7s │ %-16s │ %-16s │ %-16s │ %-16s │ %-16s │ %-16s │\n",
@@ -701,7 +653,7 @@ func imprimirTablaRendimiento(metricas []*Metricas) {
 			formatNumber(guardMag, 5), guardUnit, formatNumber(porcGuardado, 5),
 			formatNumber(totalMag, 5), totalUnit, "100.0") // Total siempre es 100%
 	}
-	fmt.Println("└─────────┴─────────┴────────┴───────────┴───────────┴──────────┴──────────┘")
+	fmt.Println("└─────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┘")
 	fmt.Println()
 
 	// Desglose de Lectura de Imágenes
@@ -717,30 +669,27 @@ func imprimirTablaRendimiento(metricas []*Metricas) {
 
 	for _, m := range metricas {
 		porcNoData := float64(m.PixelesSinDatos) / float64(m.Pixeles) * 100
-
-		// Calcula los megapíxeles sin datos
 		pixelesSinDatosMP := float64(m.PixelesSinDatos) / 1000000
 
-		// Formatear el total de píxeles
 		var totalPixUnidad string
 		var totalPixValor float64
 
 		if m.Pixeles >= 1000000 {
 			totalPixValor = float64(m.Pixeles) / 1000000
-			totalPixUnidad = "MP" // Megapíxeles
+			totalPixUnidad = "MP"
 		} else if m.Pixeles >= 1000 {
 			totalPixValor = float64(m.Pixeles) / 1000
-			totalPixUnidad = "KP" // Kilopíxeles
+			totalPixUnidad = "KP"
 		} else {
 			totalPixValor = float64(m.Pixeles)
-			totalPixUnidad = "P" // Píxeles
+			totalPixUnidad = "P"
 		}
 
 		tamanoMB := float64(m.TamanoImagen) / (1024 * 1024)
 
 		fmt.Printf("│ %-7s │ %s%-2s │ %s%% │ %-3d tiles │ %-3d tiles │ %s %-2s │ %s MB │\n",
 			m.Resolucion,
-			formatNumber(pixelesSinDatosMP, 5), "MP", formatNumber(porcNoData, 5), // Ahora muestra MP de región sin cobertura
+			formatNumber(pixelesSinDatosMP, 5), "MP", formatNumber(porcNoData, 5),
 			m.NumTilesNIR,
 			m.NumTilesRED,
 			formatNumber(totalPixValor, 5), totalPixUnidad,
@@ -750,7 +699,7 @@ func imprimirTablaRendimiento(metricas []*Metricas) {
 	fmt.Println("└─────────┴─────────┴────────┴───────────┴───────────┴──────────┴──────────┘")
 }
 
-// Función auxiliar para obtener la magnitud y la unidad de una duración
+// getMagnitudeAndUnit obtiene la magnitud y unidad adecuada para una duración
 func getMagnitudeAndUnit(d time.Duration) (float64, string) {
 	if d < time.Microsecond {
 		return float64(d.Nanoseconds()), "ns"
@@ -763,21 +712,19 @@ func getMagnitudeAndUnit(d time.Duration) (float64, string) {
 	}
 }
 
+// formatNumber formatea un número para mostrar en la tabla de métricas
 func formatNumber(num float64, desiredLength int) string {
 	integerPart := int(math.Floor(math.Abs(num)))
 	integerLength := len(strconv.Itoa(integerPart))
 
-	// Calculate how many decimal places we can show
-	// We reserve 1 spot for decimal point if needed
 	precision := 0
 	if integerLength < desiredLength {
 		precision = desiredLength - integerLength
 		if precision > 0 {
-			precision-- // Account for decimal point
+			precision--
 		}
 	}
 
-	// Format with calculated precision
 	if precision > 0 {
 		return fmt.Sprintf("%.*f", precision, num)
 	} else {
@@ -795,78 +742,76 @@ func main() {
 		{"../input_images/COMPLETE_B08_10m.jp2", "../input_images/COMPLETE_B04_10m.jp2", "10m"},
 		{"../input_images/COMPLETE_B08_20m.jp2", "../input_images/COMPLETE_B04_20m.jp2", "20m"},
 		{"../input_images/COMPLETE_B08_60m.jp2", "../input_images/COMPLETE_B04_60m.jp2", "60m"},
-		{"../input_images/INCOMPLETE_B08_10m.jp2", "../input_images/INCOMPLETE_B04_10m.jp2", "10m"},
-		{"../input_images/INCOMPLETE_B08_20m.jp2", "../input_images/INCOMPLETE_B04_20m.jp2", "20m"},
-		{"../input_images/INCOMPLETE_B08_60m.jp2", "../input_images/INCOMPLETE_B04_60m.jp2", "60m"},
 	}
 
-	// Get CPU count
+	// Obtener número de CPUs disponibles
 	numCPUs := runtime.NumCPU()
 	fmt.Printf("CPUs disponibles: %d\n\n", numCPUs)
 
-	// Configuraciones de cores para probar
-	coresConfigs := []int{12}
+	// Almacenar métricas para cada resolución
+	metricas := make([]*Metricas, 0, len(configuraciones))
 
-	// Almacenar métricas para cada resolución y modo
-	metricas := make([]*Metricas, 0, len(configuraciones)*(len(coresConfigs)+1))
+	for _, cfg := range configuraciones {
+		fmt.Printf("Procesando resolución %s...\n", cfg.Resolucion)
 
-	// Multi-threaded con diferentes configuraciones de cores
-	for _, cores := range coresConfigs {
-		fmt.Printf("\nEjecutando benchmarks en modo multi-thread con %d cores...\n", cores)
-		for _, cfg := range configuraciones {
-			// 1. Leer imágenes
-			nirResultado, redResultado, tiempoLectura, err := leerImagenesCPU(cfg.NIR, cfg.RED, cores)
-
-			if err != nil {
-				fmt.Printf("Error leyendo imágenes %s (multi-%d): %v\n", cfg.Resolucion, cores, err)
-				continue
-			}
-
-			// 2. Procesar NDVI
-			metricasNDVI, metricasColor, ndviColorImg, err := procesarNDVIMulti(nirResultado, redResultado, cfg.Resolucion, cores)
-			if err != nil {
-				fmt.Printf("Error procesando %s (multi-%d): %v\n", cfg.Resolucion, cores, err)
-				continue
-			}
-
-			// Crear estructura de métricas
-			metrica := &Metricas{
-				Resolucion:       cfg.Resolucion,
-				TiempoLectura:    tiempoLectura,
-				TiempoArchivoNIR: nirResultado.Metricas.TiempoArchivo,
-				TiempoDecodifNIR: nirResultado.Metricas.TiempoDecodif,
-				TiempoArchivoRED: redResultado.Metricas.TiempoArchivo,
-				TiempoDecodifRED: redResultado.Metricas.TiempoDecodif,
-				NumTilesNIR:      nirResultado.Metricas.NumTiles,
-				NumTilesRED:      redResultado.Metricas.NumTiles,
-				TiempoNDVI:       metricasNDVI.Tiempo,
-				Pixeles:          metricasNDVI.PixelesTotales,
-				PixelesSinDatos:  metricasNDVI.PixelesSinDatos,
-				NDVIMin:          metricasNDVI.Min,
-				NDVIMax:          metricasNDVI.Max,
-				NDVIPromedio:     metricasNDVI.Promedio,
-				TiempoColor:      metricasColor.Tiempo,
-				TamanoImagen:     metricasColor.TamanoImagen,
-			}
-
-			// 3. Guardar imágenes
-			tiempoGuardado, err := guardarImagenes(ndviColorImg, cfg.Resolucion)
-			if err != nil {
-				fmt.Printf("Error guardando imágenes %s (multi-%d): %v\n", cfg.Resolucion, cores, err)
-				continue
-			}
-			metrica.TiempoGuardado = tiempoGuardado
-
-			// Actualizar el tiempo total incluyendo todas las fases
-			metrica.TiempoTotal = metrica.TiempoLectura + metrica.TiempoNDVI + metrica.TiempoColor + metrica.TiempoGuardado
-
-			metrica.Resolucion = fmt.Sprintf("%s-M%d", cfg.Resolucion, cores) // Indicador de modo multi con # de cores
-			metricas = append(metricas, metrica)
+		// 1. Leer imagen NIR
+		inicioTotalLectura := time.Now()
+		nirResultado, err := ReadCPU(cfg.NIR, numCPUs)
+		if err != nil {
+			fmt.Printf("Error leyendo NIR %s: %v\n", cfg.Resolucion, err)
+			continue
 		}
+
+		// 2. Leer imagen RED
+		redResultado, err := ReadCPU(cfg.RED, numCPUs)
+		if err != nil {
+			fmt.Printf("Error leyendo RED %s: %v\n", cfg.Resolucion, err)
+			continue
+		}
+		tiempoLectura := time.Since(inicioTotalLectura)
+
+		// 3. Calcular NDVI y colorizar
+		metricasNDVI, metricasColor, ndviColorImg, err := CalculateNDVI(nirResultado, redResultado, numCPUs)
+		if err != nil {
+			fmt.Printf("Error calculando NDVI %s: %v\n", cfg.Resolucion, err)
+			continue
+		}
+
+		// 4. Guardar imagen resultado
+		tiempoGuardado, err := StoreCPU(ndviColorImg, cfg.Resolucion)
+		if err != nil {
+			fmt.Printf("Error guardando imagen %s: %v\n", cfg.Resolucion, err)
+			continue
+		}
+
+		// 5. Registrar métricas
+		metrica := &Metricas{
+			Resolucion:       cfg.Resolucion,
+			TiempoLectura:    tiempoLectura,
+			TiempoArchivoNIR: nirResultado.Metricas.TiempoArchivo,
+			TiempoDecodifNIR: nirResultado.Metricas.TiempoDecodif,
+			TiempoArchivoRED: redResultado.Metricas.TiempoArchivo,
+			TiempoDecodifRED: redResultado.Metricas.TiempoDecodif,
+			NumTilesNIR:      nirResultado.Metricas.NumTiles,
+			NumTilesRED:      redResultado.Metricas.NumTiles,
+			TiempoNDVI:       metricasNDVI.Tiempo,
+			Pixeles:          metricasNDVI.PixelesTotales,
+			PixelesSinDatos:  metricasNDVI.PixelesSinDatos,
+			NDVIMin:          metricasNDVI.Min,
+			NDVIMax:          metricasNDVI.Max,
+			NDVIPromedio:     metricasNDVI.Promedio,
+			TiempoColor:      metricasColor.Tiempo,
+			TamanoImagen:     metricasColor.TamanoImagen,
+			TiempoGuardado:   tiempoGuardado,
+		}
+
+		// Calcular tiempo total
+		metrica.TiempoTotal = tiempoLectura + metricasNDVI.Tiempo + metricasColor.Tiempo + tiempoGuardado
+
+		metricas = append(metricas, metrica)
 	}
 
-	// Imprimir tabla de rendimiento
+	// Imprimir tabla de métricas
 	fmt.Println("\n--- RESULTADOS DEL BENCHMARK ---")
-	fmt.Println("S: Single-thread, M#: Multi-thread (# cores)")
-	imprimirTablaRendimiento(metricas)
+	PrintMetricsTable(metricas)
 }
