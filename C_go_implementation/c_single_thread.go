@@ -8,8 +8,10 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -53,6 +55,8 @@ var ndviGradientPoints = []struct {
 
 type Metricas struct {
 	Resolucion       string
+	TipoProcesador   string // "CPU" o "GPU"
+	NumHilos         int    // Número de hilos utilizados (para CPU)
 	TiempoTotal      time.Duration
 	TiempoLectura    time.Duration
 	TiempoNDVI       time.Duration
@@ -262,6 +266,7 @@ func ReadCPU(filePath string, threads int) (*ResultadoBanda, error) {
 }
 
 // ReadGPU lee una imagen JP2 usando la GPU
+// El parámetro 'threads' se mantiene por compatibilidad con ReadCPU pero no tiene efecto en la GPU
 func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 	resultado := &ResultadoBanda{
 		Metricas: MetricasLectura{},
@@ -619,8 +624,8 @@ func CalculateNDVI(nirResultado, redResultado *ResultadoBanda, numCPUs int) (*Me
 // PrintMetricsTable imprime una tabla con las métricas de rendimiento
 func PrintMetricsTable(metricas []*Metricas) {
 	// Análisis de Cuellos de Botella
-	fmt.Println("┌ Análisis de Cuellos de Botella ───────────────┬──────────────────┬──────────────────┬──────────────────┬──────────────────┐")
-	fmt.Printf("│ %-7s │ %-16s │ %-16s │ %-16s │ %-16s │ %-16s │ %-16s │\n",
+	fmt.Println("┌ Análisis de Cuellos de Botella ─┬──────────────────┬──────────────────┬──────────────────┬──────────────────┬──────────────────┐")
+	fmt.Printf("│ %-12s │ %-16s │ %-16s │ %-16s │ %-16s │ %-16s │ %-16s │\n",
 		"Res",
 		"TTR NIR",
 		"TTR RED",
@@ -628,9 +633,17 @@ func PrintMetricsTable(metricas []*Metricas) {
 		"Proc. Color",
 		"Guardado",
 		"Total")
-	fmt.Println("├─────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┤")
+	fmt.Println("├──────────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┼─────────┬────────┤")
 
 	for _, m := range metricas {
+		// Formatear la información de resolución con tipo de procesador
+		resDisplay := m.Resolucion
+		if m.TipoProcesador == "CPU" {
+			resDisplay = fmt.Sprintf("%s CPU %dc", m.Resolucion, m.NumHilos)
+		} else if m.TipoProcesador == "GPU" {
+			resDisplay = fmt.Sprintf("%s GPU", m.Resolucion)
+		}
+
 		nirMag, nirUnit := getMagnitudeAndUnit(m.TiempoArchivoNIR + m.TiempoDecodifNIR)
 		redMag, redUnit := getMagnitudeAndUnit(m.TiempoArchivoRED + m.TiempoDecodifRED)
 		ndviMag, ndviUnit := getMagnitudeAndUnit(m.TiempoNDVI)
@@ -644,8 +657,8 @@ func PrintMetricsTable(metricas []*Metricas) {
 		porcColor := float64(m.TiempoColor) / float64(m.TiempoTotal) * 100
 		porcGuardado := float64(m.TiempoGuardado) / float64(m.TiempoTotal) * 100
 
-		fmt.Printf("│ %-7s │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │\n",
-			m.Resolucion,
+		fmt.Printf("│ %-12s │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │ %s%-2s │ %s%% │\n",
+			resDisplay,
 			formatNumber(nirMag, 5), nirUnit, formatNumber(porcNIR, 5),
 			formatNumber(redMag, 5), redUnit, formatNumber(porcRED, 5),
 			formatNumber(ndviMag, 5), ndviUnit, formatNumber(porcNDVI, 5),
@@ -653,21 +666,29 @@ func PrintMetricsTable(metricas []*Metricas) {
 			formatNumber(guardMag, 5), guardUnit, formatNumber(porcGuardado, 5),
 			formatNumber(totalMag, 5), totalUnit, "100.0") // Total siempre es 100%
 	}
-	fmt.Println("└─────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┘")
+	fmt.Println("└──────────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┘")
 	fmt.Println()
 
-	// Desglose de Lectura de Imágenes
-	fmt.Println("┌ Desglose de Lectura de Imágenes ───────┬───────────┬──────────┬──────────┐")
-	fmt.Printf("│ %-7s │ %-16s │ %-9s │ %-9s │ %-8s │ %-8s │\n",
+	// También hay que actualizar la segunda tabla
+	fmt.Println("┌ Desglose de Lectura de Imágenes ┬───────────┬───────────┬──────────┬──────────┐")
+	fmt.Printf("│ %-12s │ %-16s │ %-9s │ %-9s │ %-8s │ %-8s │\n",
 		"Res",
 		"Uncovered Region",
 		"Tiles NIR",
 		"Tiles RED",
 		"Total MP",
 		"Img Size")
-	fmt.Println("├─────────┼─────────┬────────┼───────────┼───────────┼──────────┼──────────┤")
+	fmt.Println("├──────────────┼─────────┬────────┼───────────┼───────────┼──────────┼──────────┤")
 
 	for _, m := range metricas {
+		// Formatear la información de resolución con tipo de procesador (igual que antes)
+		resDisplay := m.Resolucion
+		if m.TipoProcesador == "CPU" {
+			resDisplay = fmt.Sprintf("%s CPU %dc", m.Resolucion, m.NumHilos)
+		} else if m.TipoProcesador == "GPU" {
+			resDisplay = fmt.Sprintf("%s GPU", m.Resolucion)
+		}
+
 		porcNoData := float64(m.PixelesSinDatos) / float64(m.Pixeles) * 100
 		pixelesSinDatosMP := float64(m.PixelesSinDatos) / 1000000
 
@@ -687,8 +708,8 @@ func PrintMetricsTable(metricas []*Metricas) {
 
 		tamanoMB := float64(m.TamanoImagen) / (1024 * 1024)
 
-		fmt.Printf("│ %-7s │ %s%-2s │ %s%% │ %-3d tiles │ %-3d tiles │ %s %-2s │ %s MB │\n",
-			m.Resolucion,
+		fmt.Printf("│ %-12s │ %s%-2s │ %s%% │ %-3d tiles │ %-3d tiles │ %s %-2s │ %s MB │\n",
+			resDisplay,
 			formatNumber(pixelesSinDatosMP, 5), "MP", formatNumber(porcNoData, 5),
 			m.NumTilesNIR,
 			m.NumTilesRED,
@@ -696,7 +717,7 @@ func PrintMetricsTable(metricas []*Metricas) {
 			formatNumber(tamanoMB, 5),
 		)
 	}
-	fmt.Println("└─────────┴─────────┴────────┴───────────┴───────────┴──────────┴──────────┘")
+	fmt.Println("└──────────────┴─────────┴────────┴───────────┴───────────┴──────────┴──────────┘")
 }
 
 // getMagnitudeAndUnit obtiene la magnitud y unidad adecuada para una duración
@@ -732,6 +753,102 @@ func formatNumber(num float64, desiredLength int) string {
 	}
 }
 
+// ProcessNDVI procesa un par de imágenes JP2 (NIR y RED) para generar una imagen NDVI colorizada
+// Parámetros:
+//   - nirPath: ruta a la imagen NIR (banda B08)
+//   - redPath: ruta a la imagen RED (banda B04)
+//   - outputPath: ruta para guardar la imagen resultado
+//   - useGPU: true para usar GPU, false para CPU
+//   - threads: número de hilos a utilizar (solo para CPU)
+//
+// Devuelve las métricas del procesamiento y cualquier error que ocurra
+func ProcessNDVI(nirPath, redPath, outputPath string, useGPU bool, threads int) (*Metricas, error) {
+	// 1. Leer imagen NIR
+	inicioTotalLectura := time.Now()
+	var nirResultado, redResultado *ResultadoBanda
+	var err error
+
+	if useGPU {
+		fmt.Printf("Leyendo NIR con GPU: %s\n", nirPath)
+		nirResultado, err = ReadGPU(nirPath, 1) // El parámetro threads se ignora en GPU
+	} else {
+		fmt.Printf("Leyendo NIR con CPU (%d hilos): %s\n", threads, nirPath)
+		nirResultado, err = ReadCPU(nirPath, threads)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("error leyendo NIR: %v", err)
+	}
+
+	// 2. Leer imagen RED
+	if useGPU {
+		fmt.Printf("Leyendo RED con GPU: %s\n", redPath)
+		redResultado, err = ReadGPU(redPath, 1) // El parámetro threads se ignora en GPU
+	} else {
+		fmt.Printf("Leyendo RED con CPU (%d hilos): %s\n", threads, redPath)
+		redResultado, err = ReadCPU(redPath, threads)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("error leyendo RED: %v", err)
+	}
+
+	tiempoLectura := time.Since(inicioTotalLectura)
+
+	// 3. Calcular NDVI y colorizar
+	fmt.Printf("Calculando NDVI con %d hilos\n", threads)
+	metricasNDVI, metricasColor, ndviColorImg, err := CalculateNDVI(nirResultado, redResultado, threads)
+	if err != nil {
+		return nil, fmt.Errorf("error calculando NDVI: %v", err)
+	}
+
+	// 4. Guardar imagen resultado
+	// Extraer nombre de archivo base desde outputPath
+	outputBase := filepath.Base(outputPath)
+	outputBase = strings.TrimSuffix(outputBase, filepath.Ext(outputBase))
+
+	fmt.Printf("Guardando imagen resultado en: %s\n", outputPath)
+	tiempoGuardado, err := StoreCPU(ndviColorImg, outputBase)
+	if err != nil {
+		return nil, fmt.Errorf("error guardando imagen: %v", err)
+	}
+
+	// 5. Registrar y devolver métricas
+	var tipoProcesador string
+	if useGPU {
+		tipoProcesador = "GPU"
+	} else {
+		tipoProcesador = "CPU"
+	}
+
+	metrica := &Metricas{
+		Resolucion:       outputBase,
+		TipoProcesador:   tipoProcesador,
+		NumHilos:         threads,
+		TiempoLectura:    tiempoLectura,
+		TiempoArchivoNIR: nirResultado.Metricas.TiempoArchivo,
+		TiempoDecodifNIR: nirResultado.Metricas.TiempoDecodif,
+		TiempoArchivoRED: redResultado.Metricas.TiempoArchivo,
+		TiempoDecodifRED: redResultado.Metricas.TiempoDecodif,
+		NumTilesNIR:      nirResultado.Metricas.NumTiles,
+		NumTilesRED:      redResultado.Metricas.NumTiles,
+		TiempoNDVI:       metricasNDVI.Tiempo,
+		Pixeles:          metricasNDVI.PixelesTotales,
+		PixelesSinDatos:  metricasNDVI.PixelesSinDatos,
+		NDVIMin:          metricasNDVI.Min,
+		NDVIMax:          metricasNDVI.Max,
+		NDVIPromedio:     metricasNDVI.Promedio,
+		TiempoColor:      metricasColor.Tiempo,
+		TamanoImagen:     metricasColor.TamanoImagen,
+		TiempoGuardado:   tiempoGuardado,
+	}
+
+	// Calcular tiempo total
+	metrica.TiempoTotal = tiempoLectura + metricasNDVI.Tiempo + metricasColor.Tiempo + tiempoGuardado
+
+	return metrica, nil
+}
+
 func main() {
 	// Definir configuraciones a procesar
 	configuraciones := []struct {
@@ -744,74 +861,127 @@ func main() {
 		{"../input_images/COMPLETE_B08_60m.jp2", "../input_images/COMPLETE_B04_60m.jp2", "60m"},
 	}
 
-	// Obtener número de CPUs disponibles
-	numCPUs := runtime.NumCPU()
-	fmt.Printf("CPUs disponibles: %d\n\n", numCPUs)
+	// Definir los diferentes números de núcleos a probar
+	nucleosAProbar := []int{1, 2, 4, 6, 8, 10, 12, 14, 16}
 
-	// Almacenar métricas para cada resolución
-	metricas := make([]*Metricas, 0, len(configuraciones))
+	// Obtener número máximo de CPUs disponibles
+	maxCPUs := runtime.NumCPU()
+	fmt.Printf("CPUs disponibles: %d\n\n", maxCPUs)
+
+	// Almacenar métricas para cada resolución y configuración de núcleos
+	metricas := make([]*Metricas, 0, len(configuraciones)*(len(nucleosAProbar)+1)) // +1 para GPU
 
 	for _, cfg := range configuraciones {
-		fmt.Printf("Procesando resolución %s...\n", cfg.Resolucion)
+		fmt.Printf("=== Procesando resolución %s ===\n", cfg.Resolucion)
 
-		// 1. Leer imagen NIR
-		inicioTotalLectura := time.Now()
-		nirResultado, err := ReadCPU(cfg.NIR, numCPUs)
+		// Procesar con diferentes configuraciones de CPU
+		for _, numNucleos := range nucleosAProbar {
+			// Saltarse configuraciones que excedan el número de CPUs disponibles
+			if numNucleos > maxCPUs {
+				fmt.Printf("\nSaltando prueba con %d núcleos (máximo disponible: %d)\n",
+					numNucleos, maxCPUs)
+				continue
+			}
+
+			fmt.Printf("\n>> Modo CPU (%d núcleos)\n", numNucleos)
+			metricaCPU, err := ProcessNDVI(
+				cfg.NIR,
+				cfg.RED,
+				cfg.Resolucion,
+				false, // useGPU = false
+				numNucleos,
+			)
+			if err != nil {
+				fmt.Printf("Error procesando %s con %d CPUs: %v\n",
+					cfg.Resolucion, numNucleos, err)
+			} else {
+				metricas = append(metricas, metricaCPU)
+			}
+		}
+
+		// Procesar con GPU si está disponible
+		fmt.Printf("\n>> Modo GPU\n")
+		metricaGPU, err := ProcessNDVI(
+			cfg.NIR,
+			cfg.RED,
+			cfg.Resolucion,
+			true, // useGPU = true
+			1,    // threads no se usa en GPU
+		)
 		if err != nil {
-			fmt.Printf("Error leyendo NIR %s: %v\n", cfg.Resolucion, err)
-			continue
+			fmt.Printf("Error procesando %s con GPU: %v\n", cfg.Resolucion, err)
+			fmt.Printf("¿Está disponible la GPU con soporte CUDA y nvJPEG2000?\n")
+		} else {
+			metricas = append(metricas, metricaGPU)
 		}
 
-		// 2. Leer imagen RED
-		redResultado, err := ReadCPU(cfg.RED, numCPUs)
-		if err != nil {
-			fmt.Printf("Error leyendo RED %s: %v\n", cfg.Resolucion, err)
-			continue
-		}
-		tiempoLectura := time.Since(inicioTotalLectura)
-
-		// 3. Calcular NDVI y colorizar
-		metricasNDVI, metricasColor, ndviColorImg, err := CalculateNDVI(nirResultado, redResultado, numCPUs)
-		if err != nil {
-			fmt.Printf("Error calculando NDVI %s: %v\n", cfg.Resolucion, err)
-			continue
-		}
-
-		// 4. Guardar imagen resultado
-		tiempoGuardado, err := StoreCPU(ndviColorImg, cfg.Resolucion)
-		if err != nil {
-			fmt.Printf("Error guardando imagen %s: %v\n", cfg.Resolucion, err)
-			continue
-		}
-
-		// 5. Registrar métricas
-		metrica := &Metricas{
-			Resolucion:       cfg.Resolucion,
-			TiempoLectura:    tiempoLectura,
-			TiempoArchivoNIR: nirResultado.Metricas.TiempoArchivo,
-			TiempoDecodifNIR: nirResultado.Metricas.TiempoDecodif,
-			TiempoArchivoRED: redResultado.Metricas.TiempoArchivo,
-			TiempoDecodifRED: redResultado.Metricas.TiempoDecodif,
-			NumTilesNIR:      nirResultado.Metricas.NumTiles,
-			NumTilesRED:      redResultado.Metricas.NumTiles,
-			TiempoNDVI:       metricasNDVI.Tiempo,
-			Pixeles:          metricasNDVI.PixelesTotales,
-			PixelesSinDatos:  metricasNDVI.PixelesSinDatos,
-			NDVIMin:          metricasNDVI.Min,
-			NDVIMax:          metricasNDVI.Max,
-			NDVIPromedio:     metricasNDVI.Promedio,
-			TiempoColor:      metricasColor.Tiempo,
-			TamanoImagen:     metricasColor.TamanoImagen,
-			TiempoGuardado:   tiempoGuardado,
-		}
-
-		// Calcular tiempo total
-		metrica.TiempoTotal = tiempoLectura + metricasNDVI.Tiempo + metricasColor.Tiempo + tiempoGuardado
-
-		metricas = append(metricas, metrica)
+		fmt.Println("\n-----------------------------------")
 	}
 
 	// Imprimir tabla de métricas
-	fmt.Println("\n--- RESULTADOS DEL BENCHMARK ---")
-	PrintMetricsTable(metricas)
+	if len(metricas) > 0 {
+		fmt.Println("\n--- RESULTADOS DEL BENCHMARK ---")
+		PrintMetricsTable(metricas)
+
+		// También generar un resumen de escalabilidad para cada resolución
+		fmt.Println("\n--- ANÁLISIS DE ESCALABILIDAD ---")
+		for _, cfg := range configuraciones {
+			metricasPorResolucion := make(map[string][]*Metricas)
+			for _, m := range metricas {
+				// Extraer la resolución base (sin sufijo _cpu_XXc o _gpu)
+				baseRes := strings.SplitN(m.Resolucion, "_", 2)[0]
+				if baseRes == cfg.Resolucion {
+					metricasPorResolucion[baseRes] = append(metricasPorResolucion[baseRes], m)
+				}
+			}
+
+			for res, ms := range metricasPorResolucion {
+				if len(ms) > 0 {
+					fmt.Printf("\nResolución: %s\n", res)
+					fmt.Println("┌────────────┬────────────┬─────────┬────────────┐")
+					fmt.Printf("│ %-10s │ %-10s │ %-7s │ %-10s │\n",
+						"Procesador", "Tiempo (s)", "Speedup", "Eficiencia")
+					fmt.Println("├────────────┼────────────┼─────────┼────────────┤")
+
+					// Encontrar la métrica de referencia (1 núcleo)
+					var tiempoBase float64
+					for _, m := range ms {
+						if m.TipoProcesador == "CPU" && m.NumHilos == 1 {
+							tiempoBase = m.TiempoTotal.Seconds()
+							break
+						}
+					}
+
+					// Si no encontramos métrica de 1 núcleo, usamos la primera disponible
+					if tiempoBase == 0 && len(ms) > 0 {
+						tiempoBase = ms[0].TiempoTotal.Seconds()
+					}
+
+					// Mostrar métricas ordenadas por procesador
+					for _, m := range ms {
+						tiempo := m.TiempoTotal.Seconds()
+						speedup := tiempoBase / tiempo
+						eficiencia := 0.0
+
+						if m.TipoProcesador == "CPU" {
+							eficiencia = speedup / float64(m.NumHilos)
+						} else {
+							eficiencia = speedup // Para GPU no calculamos eficiencia
+						}
+
+						procLabel := fmt.Sprintf("%s %d", m.TipoProcesador, m.NumHilos)
+						if m.TipoProcesador == "GPU" {
+							procLabel = "GPU"
+						}
+
+						fmt.Printf("│ %-10s │ %10.3f │ %7.2f │ %10.2f │\n",
+							procLabel, tiempo, speedup, eficiencia)
+					}
+					fmt.Println("└────────────┴────────────┴─────────┴────────────┘")
+				}
+			}
+		}
+	} else {
+		fmt.Println("\nNo se pudo completar ninguna operación con éxito.")
+	}
 }
