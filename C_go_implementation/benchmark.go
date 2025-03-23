@@ -483,6 +483,158 @@ func StoreCPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error
 	return tiempoGuardado, err
 }
 
+// StoreGPU guarda una imagen NDVI como JPEG2000 usando la GPU
+func StoreGPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error) {
+	inicioGuardado := time.Now()
+
+	// Crear directorio si no existe
+	os.MkdirAll("./go_jp2_direct", 0755)
+
+	// Nombre del archivo de salida (usamos .jp2 para JPEG2000)
+	nombreColor := fmt.Sprintf("./go_jp2_direct/ndvi_%s_color.jp2", resolucion)
+
+	// Inicialización del encoder nvjpeg2k
+	var encoder C.nvjpeg2kEncoder_t
+	if status := C.nvjpeg2kEncoderCreateSimple(&encoder); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to create encoder: %v", status)
+	}
+	defer C.nvjpeg2kEncoderDestroy(encoder)
+
+	var encodeState C.nvjpeg2kEncodeState_t
+	if status := C.nvjpeg2kEncodeStateCreate(encoder, &encodeState); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to create encode state: %v", status)
+	}
+	defer C.nvjpeg2kEncodeStateDestroy(encodeState)
+
+	var encodeParams C.nvjpeg2kEncodeParams_t
+	if status := C.nvjpeg2kEncodeParamsCreate(&encodeParams); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to create encode params: %v", status)
+	}
+	defer C.nvjpeg2kEncodeParamsDestroy(encodeParams)
+
+	// Configurar formato de entrada para datos RGBA (interleaved)
+	if status := C.nvjpeg2kEncodeParamsSetInputFormat(encodeParams, C.NVJPEG2K_FORMAT_INTERLEAVED); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to set input format: %v", status)
+	}
+
+	// Configurar calidad (usando PSNR - mayor número = mejor calidad)
+	if status := C.nvjpeg2kEncodeParamsSetQuality(encodeParams, 40.0); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to set quality: %v", status)
+	}
+
+	// Dimensiones de la imagen
+	imgBounds := ndviColorImg.Bounds()
+	width := imgBounds.Dx()
+	height := imgBounds.Dy()
+
+	// Configurar los parámetros de codificación JP2
+	compInfoSize := C.size_t(unsafe.Sizeof(C.nvjpeg2kImageComponentInfo_t{})) * 4 // 4 componentes RGBA
+	compInfoPtr := C.malloc(compInfoSize)
+	defer C.free(compInfoPtr)
+
+	// Configurar la estructura de configuración de codificación
+	encodeConfig := C.nvjpeg2kEncodeConfig_t{
+		stream_type:     C.NVJPEG2K_STREAM_JP2,      // Formato JP2
+		color_space:     C.NVJPEG2K_COLORSPACE_SRGB, // Color RGB
+		image_width:     C.uint32_t(width),
+		image_height:    C.uint32_t(height),
+		num_components:  4, // RGBA
+		image_comp_info: (*C.nvjpeg2kImageComponentInfo_t)(compInfoPtr),
+		prog_order:      C.NVJPEG2K_LRCP, // Orden de progresión estándar
+		num_layers:      1,
+		mct_mode:        1,  // Transformación de color activada
+		num_resolutions: 6,  // Número de niveles de resolución
+		code_block_w:    64, // Ancho de bloque de código
+		code_block_h:    64, // Alto de bloque de código
+		irreversible:    1,  // Transformación irreversible para mejor compresión
+	}
+
+	// Configurar cada componente
+	for i := 0; i < 4; i++ {
+		compInfo := (*C.nvjpeg2kImageComponentInfo_t)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(encodeConfig.image_comp_info)) + uintptr(i)*unsafe.Sizeof(C.nvjpeg2kImageComponentInfo_t{}),
+		))
+		compInfo.component_width = C.uint32_t(width)
+		compInfo.component_height = C.uint32_t(height)
+		compInfo.precision = 8 // 8 bits por componente
+		compInfo.sgn = 0       // Sin signo
+	}
+
+	// Aplicar la configuración de codificación
+	if status := C.nvjpeg2kEncodeParamsSetEncodeConfig(encodeParams, &encodeConfig); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to set encode config: %v", status)
+	}
+
+	// Preparar la imagen para codificación en GPU
+	outputImage := C.nvjpeg2kImage_t{
+		pixel_type:     C.NVJPEG2K_UINT8,
+		num_components: 4, // RGBA
+		pixel_data:     (*unsafe.Pointer)(C.malloc(C.size_t(4) * C.size_t(unsafe.Sizeof(unsafe.Pointer(nil))))),
+		pitch_in_bytes: (*C.size_t)(C.malloc(C.size_t(4) * C.size_t(unsafe.Sizeof(C.size_t(0))))),
+	}
+	defer C.free(unsafe.Pointer(outputImage.pixel_data))
+	defer C.free(unsafe.Pointer(outputImage.pitch_in_bytes))
+
+	// Asignar memoria en GPU para los datos de la imagen
+	var devicePtr unsafe.Pointer
+	totalSize := width * height * 4 // 4 bytes por pixel RGBA
+
+	if status := C.cudaMalloc(&devicePtr, C.size_t(totalSize)); status != C.cudaSuccess {
+		return 0, fmt.Errorf("cudaMalloc failed: %v", status)
+	}
+	defer C.cudaFree(devicePtr)
+
+	// Transferir datos de la imagen CPU a GPU
+	if status := C.cudaMemcpy(
+		devicePtr,
+		unsafe.Pointer(&ndviColorImg.Pix[0]),
+		C.size_t(totalSize),
+		C.cudaMemcpyHostToDevice,
+	); status != C.cudaSuccess {
+		return 0, fmt.Errorf("cudaMemcpy to device failed: %v", status)
+	}
+
+	// Configurar puntero y pitch para la imagen
+	ptrArray := (*[4]*C.uchar)(unsafe.Pointer(outputImage.pixel_data))
+	ptrArray[0] = (*C.uchar)(devicePtr)
+
+	pitchArray := (*[4]C.size_t)(unsafe.Pointer(outputImage.pitch_in_bytes))
+	pitchArray[0] = C.size_t(width * 4) // 4 bytes por pixel (RGBA)
+
+	// Codificar la imagen
+	if status := C.nvjpeg2kEncode(encoder, encodeState, encodeParams, &outputImage, nil); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("encode failed: %v", status)
+	}
+
+	// Obtener el tamaño del bitstream codificado
+	var length C.size_t
+	if status := C.nvjpeg2kEncodeRetrieveBitstream(encoder, encodeState, nil, &length, nil); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to get bitstream size: %v", status)
+	}
+
+	// Asignar memoria para el bitstream
+	bitstreamData := make([]byte, int(length))
+
+	// Recuperar los datos codificados
+	if status := C.nvjpeg2kEncodeRetrieveBitstream(
+		encoder,
+		encodeState,
+		(*C.uchar)(unsafe.Pointer(&bitstreamData[0])),
+		&length,
+		nil,
+	); status != C.NVJPEG2K_STATUS_SUCCESS {
+		return 0, fmt.Errorf("failed to retrieve bitstream: %v", status)
+	}
+
+	// Guardar a archivo
+	if err := os.WriteFile(nombreColor, bitstreamData[:int(length)], 0644); err != nil {
+		return 0, fmt.Errorf("failed to write file: %v", err)
+	}
+
+	tiempoGuardado := time.Since(inicioGuardado)
+	return tiempoGuardado, nil
+}
+
 // CalculateNDVI calcula el índice NDVI y genera una imagen colorizada
 func CalculateNDVI(nirResultado, redResultado *ResultadoBanda, numCPUs int) (*MetricasNDVI, *MetricasColor, *image.RGBA, error) {
 	metricasNDVI := &MetricasNDVI{
@@ -809,7 +961,17 @@ func ProcessNDVI(nirPath, redPath, outputPath string, useGPU bool, threads int) 
 	outputBase = strings.TrimSuffix(outputBase, filepath.Ext(outputBase))
 
 	fmt.Printf("Guardando imagen resultado en: %s\n", outputPath)
-	tiempoGuardado, err := StoreCPU(ndviColorImg, outputBase)
+	var tiempoGuardado time.Duration
+
+	// Usar StoreGPU si estamos en modo GPU, StoreCPU en caso contrario
+	if useGPU {
+		fmt.Printf("Usando codificador GPU para guardar imagen\n")
+		tiempoGuardado, err = StoreGPU(ndviColorImg, outputBase)
+	} else {
+		fmt.Printf("Usando codificador CPU para guardar imagen\n")
+		tiempoGuardado, err = StoreCPU(ndviColorImg, outputBase)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("error guardando imagen: %v", err)
 	}
