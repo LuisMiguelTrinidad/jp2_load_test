@@ -54,21 +54,6 @@ var ndviGradientPoints = []struct {
 	{1.0, color.RGBA{0, 128, 0, 255}},     // Verde (vegetación densa)
 }
 
-func printMemUsage() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	fmt.Printf("Alloc = %v MiB", m.Alloc/1024/1024)
-	fmt.Printf("\tTotalAlloc = %v MiB", m.TotalAlloc/1024/1024)
-	fmt.Printf("\tSys = %v MiB", m.Sys/1024/1024)
-	fmt.Printf("\tNumGC = %v MiB", m.NumGC)
-	fmt.Printf("\tHeapAlloc = %v MiB", m.HeapAlloc/1024/1024)
-	fmt.Printf("\tHeapSys = %v MiB", m.HeapSys/1024/1024)
-	fmt.Printf("\tHeapIdle = %v MiB", m.HeapIdle/1024/1024)
-	fmt.Printf("\tHeapInuse = %v MiB", m.HeapInuse/1024/1024)
-	fmt.Printf("\tHeapReleased = %v MiB", m.HeapReleased/1024/1024)
-	fmt.Printf("\tHeapObjects = %v MiB\n", m.HeapObjects)
-}
-
 type Metricas struct {
 	Resolucion       string
 	TipoProcesador   string // "CPU" o "GPU"
@@ -317,6 +302,7 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 	}
 
 	inicioTotal := time.Now()
+	fmt.Printf("GPU: Iniciando decodificación de %s\n", filepath.Base(filePath))
 
 	// Inicialización de CUDA y nvjpeg2k
 	var handle C.nvjpeg2kHandle_t
@@ -346,7 +332,12 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 		return nil, fmt.Errorf("failed to get image info: %v", status)
 	}
 
-	resultado.Metricas.TiempoArchivo = time.Since(inicioArchivo)
+	tiempoArchivo := time.Since(inicioArchivo)
+	resultado.Metricas.TiempoArchivo = tiempoArchivo
+	fmt.Printf("GPU: Tiempo de lectura de archivo: %v\n", tiempoArchivo)
+	fmt.Printf("GPU: Dimensiones de imagen: %dx%d, %d componentes, %dx%d tiles\n",
+		imageInfo.image_width, imageInfo.image_height, imageInfo.num_components,
+		imageInfo.num_tiles_x, imageInfo.num_tiles_y)
 
 	// Decodificación
 	inicioDecodif := time.Now()
@@ -370,6 +361,7 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 	default:
 		return nil, errors.New("precisión/signo de componente no soportado")
 	}
+	fmt.Printf("GPU: Tipo de pixel: %v, precisión: %d bits, signo: %d\n", pixelType, compInfo.precision, compInfo.sgn)
 
 	// Configuración de parámetros de decodificación
 	var decodeParams C.nvjpeg2kDecodeParams_t
@@ -400,24 +392,35 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 	devicePtrs := make([]unsafe.Pointer, numComponents)
 	defer func() {
 		for _, ptr := range devicePtrs {
-			C.cudaFree(ptr)
+			if ptr != nil {
+				fmt.Printf("GPU: Liberando memoria GPU: %v\n", ptr)
+				C.cudaFree(ptr)
+			}
 		}
 	}()
 
-	// Preparar memoria para cada componente
-	for i := range numComponents {
+	var totalGPUMemory int64 = 0
+
+	// CORRECCIÓN: Usar un bucle for tradicional en lugar de range
+	fmt.Printf("GPU: Asignando memoria para %d componentes\n", numComponents)
+	for i := 0; i < numComponents; i++ {
 		if status := C.nvjpeg2kStreamGetImageComponentInfo(stream, &compInfo, C.uint32_t(i)); status != C.NVJPEG2K_STATUS_SUCCESS {
-			return nil, fmt.Errorf("failed to get component info: %v", status)
+			return nil, fmt.Errorf("failed to get component info for component %d: %v", i, status)
 		}
 
 		bytesPerPixel := (int(compInfo.precision) + 7) / 8
 		size := int(compInfo.component_width) * int(compInfo.component_height) * bytesPerPixel
+		totalGPUMemory += int64(size)
+
+		fmt.Printf("GPU: Componente %d: %dx%d, %d bytes/pixel, total %d bytes\n",
+			i, compInfo.component_width, compInfo.component_height, bytesPerPixel, size)
 
 		var devPtr unsafe.Pointer
 		if status := C.cudaMalloc(&devPtr, C.size_t(size)); status != C.cudaSuccess {
-			return nil, fmt.Errorf("cudaMalloc failed: %v", status)
+			return nil, fmt.Errorf("cudaMalloc failed for component %d (%d bytes): %v", i, size, status)
 		}
 		devicePtrs[i] = devPtr
+		fmt.Printf("GPU: Memoria asignada para componente %d: %v (%d bytes)\n", i, devPtr, size)
 
 		ptrArray := (*[1<<30 - 1]*C.uchar)(unsafe.Pointer(outputImage.pixel_data))[:numComponents:numComponents]
 		ptrArray[i] = (*C.uchar)(devPtr)
@@ -426,10 +429,28 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 		pitchArray[i] = C.size_t(int(compInfo.component_width) * bytesPerPixel)
 	}
 
+	fmt.Printf("GPU: Total memoria GPU asignada: %.2f MB\n", float64(totalGPUMemory)/(1024*1024))
+
+	// Añadir sincronización antes de decodificar para asegurar que todas las asignaciones estén completas
+	if status := C.cudaDeviceSynchronize(); status != C.cudaSuccess {
+		return nil, fmt.Errorf("cudaDeviceSynchronize failed before decode: %v", status)
+	}
+
+	fmt.Printf("GPU: Iniciando decodificación...\n")
+	inicioDecodeReal := time.Now()
+
 	// Decodificar la imagen
 	if status := C.nvjpeg2kDecodeImage(handle, decodeState, stream, decodeParams, &outputImage, nil); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return nil, fmt.Errorf("decode failed: %v", status)
 	}
+
+	// Asegurar que la decodificación haya terminado
+	if status := C.cudaDeviceSynchronize(); status != C.cudaSuccess {
+		return nil, fmt.Errorf("cudaDeviceSynchronize failed after decode: %v", status)
+	}
+
+	tiempoDecodeReal := time.Since(inicioDecodeReal)
+	fmt.Printf("GPU: Decodificación completada en %v\n", tiempoDecodeReal)
 
 	// Crear la estructura JP2Image para el resultado
 	jp2Image := &JP2Image{
@@ -440,6 +461,9 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 	}
 
 	// Transferir datos de GPU a CPU y convertir a float32
+	inicioTransfer := time.Now()
+	fmt.Printf("GPU: Iniciando transferencia de datos a CPU...\n")
+
 	for i := 0; i < numComponents; i++ {
 		if status := C.nvjpeg2kStreamGetImageComponentInfo(stream, &compInfo, C.uint32_t(i)); status != C.NVJPEG2K_STATUS_SUCCESS {
 			return nil, fmt.Errorf("failed to get component info: %v", status)
@@ -457,16 +481,21 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 		dataPtr := (*[1<<30 - 1]*C.uchar)(unsafe.Pointer(outputImage.pixel_data))[i]
 
 		// Transferir de GPU a CPU
+		inicioTransferComp := time.Now()
 		if status := C.cudaMemcpy(
 			unsafe.Pointer(&rawData[0]),
 			unsafe.Pointer(dataPtr),
 			C.size_t(totalSize),
 			C.cudaMemcpyDeviceToHost,
 		); status != C.cudaSuccess {
-			return nil, fmt.Errorf("cudaMemcpy failed: %v", status)
+			return nil, fmt.Errorf("cudaMemcpy failed for component %d: %v", i, status)
 		}
+		tiempoTransferComp := time.Since(inicioTransferComp)
+		fmt.Printf("GPU: Transferencia de componente %d completada en %v (%.2f MB/s)\n",
+			i, tiempoTransferComp, float64(totalSize)/tiempoTransferComp.Seconds()/(1024*1024))
 
 		// Asignar memoria para los datos normalizados
+		inicioNormalizacion := time.Now()
 		jp2Image.Data[i] = make([]float32, width*height)
 
 		// Factor para normalizar según precisión
@@ -491,12 +520,25 @@ func ReadGPU(filePath string, threads int) (*ResultadoBanda, error) {
 				}
 			}
 		}
+		tiempoNormalizacion := time.Since(inicioNormalizacion)
+		fmt.Printf("GPU: Normalización de componente %d completada en %v\n", i, tiempoNormalizacion)
 	}
+
+	tiempoTransfer := time.Since(inicioTransfer)
+	fmt.Printf("GPU: Transferencia y normalización completada en %v\n", tiempoTransfer)
+
+	// Estadísticas de memoria
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	fmt.Printf("GPU: Memoria Go en uso: %.2f MB, Sistema: %.2f MB\n",
+		float64(memStats.Alloc)/(1024*1024), float64(memStats.Sys)/(1024*1024))
 
 	resultado.Metricas.TiempoDecodif = time.Since(inicioDecodif)
 	resultado.Metricas.NumTiles = int(imageInfo.num_tiles_x * imageInfo.num_tiles_y)
 	resultado.Metricas.TiempoTotal = time.Since(inicioTotal)
 	resultado.Imagen = jp2Image
+
+	fmt.Printf("GPU: Decodificación completa en %v (total con transferencia)\n", resultado.Metricas.TiempoDecodif)
 
 	return resultado, nil
 }
@@ -569,21 +611,20 @@ func StoreCPU(ndviColorImg *image.RGBA, resolucion string, threads int) (time.Du
 			// Force data to be nil to break reference
 			data = nil
 		}
-
 	}
+
 	// Configurar parámetros del encoder
 	var parameters C.opj_cparameters_t
 	C.opj_set_default_encoder_parameters(&parameters)
 
-	// Limitar el número de hilos para imágenes grandes para evitar
-	// consumo excesivo de memoria
-
-	// Resto de la configuración igual...
+	// Configurar parámetros para igualar los de GPU
 	parameters.tcp_numlayers = 1
 	parameters.tcp_rates[0] = 0
-	parameters.irreversible = 0
+	parameters.irreversible = 1 // Cambiar a 1 para igualar la GPU (era 0)
 	parameters.numresolution = 6
 	parameters.cp_disto_alloc = 1
+	parameters.cblockw_init = 64 // Añadir esto para igualar tamaño de bloque
+	parameters.cblockh_init = 64 // Añadir esto para igualar tamaño de bloque
 
 	// Crear codec JP2
 	codec := C.opj_create_compress(C.OPJ_CODEC_JP2)
@@ -602,12 +643,35 @@ func StoreGPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error
 	inicioGuardado := time.Now()
 
 	// Crear directorio si no existe
-	os.MkdirAll("./go_jp2_direct", 0755)
+	inicioCrearDir := time.Now()
+	if err := os.MkdirAll("./go_jp2_direct", 0755); err != nil {
+		return 0, fmt.Errorf("failed to create directory: %v", err)
+	}
+	fmt.Printf("GPU-Store: Tiempo creación directorio: %v\n", time.Since(inicioCrearDir))
 
 	// Nombre del archivo de salida (usamos .jp2 para JPEG2000)
 	nombreColor := fmt.Sprintf("./go_jp2_direct/ndvi_%s_color.jp2", resolucion)
 
+	// Dimensiones de la imagen
+	imgBounds := ndviColorImg.Bounds()
+	width := imgBounds.Dx()
+	height := imgBounds.Dy()
+	totalPixeles := width * height
+	totalBytes := totalPixeles * 4 // 4 bytes por pixel RGBA
+
+	fmt.Printf("GPU-Store: Guardando imagen %dx%d (%d pixels, %.2f MB) a %s\n",
+		width, height, totalPixeles, float64(totalBytes)/(1024*1024),
+		filepath.Base(nombreColor))
+
+	// Estado inicial de memoria
+	var memStatsBefore runtime.MemStats
+	runtime.ReadMemStats(&memStatsBefore)
+	fmt.Printf("GPU-Store: Memoria Go inicial: %.2f MB (Heap: %.2f MB)\n",
+		float64(memStatsBefore.Alloc)/(1024*1024),
+		float64(memStatsBefore.HeapAlloc)/(1024*1024))
+
 	// Inicialización del encoder nvjpeg2k
+	inicioInit := time.Now()
 	var encoder C.nvjpeg2kEncoder_t
 	if status := C.nvjpeg2kEncoderCreateSimple(&encoder); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return 0, fmt.Errorf("failed to create encoder: %v", status)
@@ -626,20 +690,20 @@ func StoreGPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error
 	}
 	defer C.nvjpeg2kEncodeParamsDestroy(encodeParams)
 
+	fmt.Printf("GPU-Store: Inicialización del encoder: %v\n", time.Since(inicioInit))
+
 	// Configurar formato de entrada para datos RGBA (interleaved)
+	inicioConfig := time.Now()
 	if status := C.nvjpeg2kEncodeParamsSetInputFormat(encodeParams, C.NVJPEG2K_FORMAT_INTERLEAVED); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return 0, fmt.Errorf("failed to set input format: %v", status)
 	}
 
 	// Configurar calidad (usando PSNR - mayor número = mejor calidad)
-	if status := C.nvjpeg2kEncodeParamsSetQuality(encodeParams, 40.0); status != C.NVJPEG2K_STATUS_SUCCESS {
+	const calidadPSNR float64 = 40.0
+	if status := C.nvjpeg2kEncodeParamsSetQuality(encodeParams, C.double(calidadPSNR)); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return 0, fmt.Errorf("failed to set quality: %v", status)
 	}
-
-	// Dimensiones de la imagen
-	imgBounds := ndviColorImg.Bounds()
-	width := imgBounds.Dx()
-	height := imgBounds.Dy()
+	fmt.Printf("GPU-Store: Calidad de codificación configurada: %.1f PSNR\n", calidadPSNR)
 
 	// Configurar los parámetros de codificación JP2
 	compInfoSize := C.size_t(unsafe.Sizeof(C.nvjpeg2kImageComponentInfo_t{})) * 4 // 4 componentes RGBA
@@ -679,17 +743,23 @@ func StoreGPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error
 		return 0, fmt.Errorf("failed to set encode config: %v", status)
 	}
 
+	fmt.Printf("GPU-Store: Configuración de parámetros: %v\n", time.Since(inicioConfig))
+
 	// Preparar la imagen para codificación en GPU
+	inicioPreparar := time.Now()
 	outputImage := C.nvjpeg2kImage_t{
 		pixel_type:     C.NVJPEG2K_UINT8,
 		num_components: 4, // RGBA
-		pixel_data:     (*unsafe.Pointer)(C.malloc(C.size_t(4) * C.size_t(unsafe.Sizeof(unsafe.Pointer(nil))))),
-		pitch_in_bytes: (*C.size_t)(C.malloc(C.size_t(4) * C.size_t(unsafe.Sizeof(C.size_t(0))))),
+		pixel_data:     (*unsafe.Pointer)(C.malloc(C.size_t(unsafe.Sizeof(unsafe.Pointer(nil))))),
+		pitch_in_bytes: (*C.size_t)(C.malloc(C.size_t(unsafe.Sizeof(C.size_t(0))))),
 	}
 	defer C.free(unsafe.Pointer(outputImage.pixel_data))
 	defer C.free(unsafe.Pointer(outputImage.pitch_in_bytes))
 
+	fmt.Printf("GPU-Store: Preparación de estructura de imagen: %v\n", time.Since(inicioPreparar))
+
 	// Asignar memoria en GPU para los datos de la imagen
+	inicioAsignarGPU := time.Now()
 	var devicePtr unsafe.Pointer
 	totalSize := width * height * 4 // 4 bytes por pixel RGBA
 
@@ -698,7 +768,11 @@ func StoreGPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error
 	}
 	defer C.cudaFree(devicePtr)
 
+	fmt.Printf("GPU-Store: Memoria GPU asignada: %.2f MB en %v\n",
+		float64(totalSize)/(1024*1024), time.Since(inicioAsignarGPU))
+
 	// Transferir datos de la imagen CPU a GPU
+	inicioTransfer := time.Now()
 	if status := C.cudaMemcpy(
 		devicePtr,
 		unsafe.Pointer(&ndviColorImg.Pix[0]),
@@ -708,23 +782,46 @@ func StoreGPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error
 		return 0, fmt.Errorf("cudaMemcpy to device failed: %v", status)
 	}
 
+	tiempoTransfer := time.Since(inicioTransfer)
+	velocidadTransfer := float64(totalSize) / tiempoTransfer.Seconds() / (1024 * 1024)
+	fmt.Printf("GPU-Store: Transferencia CPU→GPU: %v (%.2f MB/s)\n",
+		tiempoTransfer, velocidadTransfer)
+
 	// Configurar puntero y pitch para la imagen
+	inicioConfig2 := time.Now()
 	ptrArray := (*[4]*C.uchar)(unsafe.Pointer(outputImage.pixel_data))
 	ptrArray[0] = (*C.uchar)(devicePtr)
 
 	pitchArray := (*[4]C.size_t)(unsafe.Pointer(outputImage.pitch_in_bytes))
 	pitchArray[0] = C.size_t(width * 4) // 4 bytes por pixel (RGBA)
 
+	fmt.Printf("GPU-Store: Configuración punteros: %v\n", time.Since(inicioConfig2))
+
 	// Codificar la imagen
+	inicioEncode := time.Now()
 	if status := C.nvjpeg2kEncode(encoder, encodeState, encodeParams, &outputImage, nil); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return 0, fmt.Errorf("encode failed: %v", status)
 	}
 
+	// Sincronizar para asegurar que la codificación ha terminado
+	if status := C.cudaDeviceSynchronize(); status != C.cudaSuccess {
+		return 0, fmt.Errorf("cudaDeviceSynchronize after encode failed: %v", status)
+	}
+
+	tiempoEncode := time.Since(inicioEncode)
+	fmt.Printf("GPU-Store: Codificación completada: %v (%.2f MP/s)\n",
+		tiempoEncode, float64(totalPixeles)/tiempoEncode.Seconds()/1000000)
+
 	// Obtener el tamaño del bitstream codificado
+	inicioRetrieval := time.Now()
 	var length C.size_t
 	if status := C.nvjpeg2kEncodeRetrieveBitstream(encoder, encodeState, nil, &length, nil); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return 0, fmt.Errorf("failed to get bitstream size: %v", status)
 	}
+
+	fmt.Printf("GPU-Store: Tamaño del bitstream: %.2f MB, ratio de compresión: %.2f:1\n",
+		float64(length)/(1024*1024),
+		float64(totalSize)/float64(length))
 
 	// Asignar memoria para el bitstream
 	bitstreamData := make([]byte, int(length))
@@ -740,12 +837,42 @@ func StoreGPU(ndviColorImg *image.RGBA, resolucion string) (time.Duration, error
 		return 0, fmt.Errorf("failed to retrieve bitstream: %v", status)
 	}
 
+	// Después de recuperar el bitstream
+	if status := C.cudaDeviceSynchronize(); status != C.cudaSuccess {
+		return 0, fmt.Errorf("cudaDeviceSynchronize failed: %v", status)
+	}
+
+	tiempoRetrieval := time.Since(inicioRetrieval)
+	velocidadRetrieval := float64(length) / tiempoRetrieval.Seconds() / (1024 * 1024)
+	fmt.Printf("GPU-Store: Recuperación de bitstream: %v (%.2f MB/s)\n",
+		tiempoRetrieval, velocidadRetrieval)
+
 	// Guardar a archivo
+	inicioGuardarArchivo := time.Now()
 	if err := os.WriteFile(nombreColor, bitstreamData[:int(length)], 0644); err != nil {
 		return 0, fmt.Errorf("failed to write file: %v", err)
 	}
 
+	tiempoGuardarArchivo := time.Since(inicioGuardarArchivo)
+	velocidadEscritura := float64(length) / tiempoGuardarArchivo.Seconds() / (1024 * 1024)
+	fmt.Printf("GPU-Store: Escritura a disco: %v (%.2f MB/s)\n",
+		tiempoGuardarArchivo, velocidadEscritura)
+
+	// Estado final de memoria
+	var memStatsAfter runtime.MemStats
+	runtime.ReadMemStats(&memStatsAfter)
+	fmt.Printf("GPU-Store: Memoria Go final: %.2f MB (Heap: %.2f MB, Δ: %.2f MB)\n",
+		float64(memStatsAfter.Alloc)/(1024*1024),
+		float64(memStatsAfter.HeapAlloc)/(1024*1024),
+		float64(memStatsAfter.Alloc-memStatsBefore.Alloc)/(1024*1024))
+
 	tiempoGuardado := time.Since(inicioGuardado)
+	fmt.Printf("GPU-Store: Tiempo total de guardado: %v\n", tiempoGuardado)
+
+	// Liberar memoria explícitamente
+	bitstreamData = nil
+	runtime.GC()
+
 	return tiempoGuardado, nil
 }
 
@@ -1218,7 +1345,7 @@ func main() {
 	}
 
 	// Definir los diferentes números de núcleos a probar
-	nucleosAProbar := []int{1, 2, 4, 8, 12, 16}
+	nucleosAProbar := []int{16}
 
 	// Obtener número máximo de CPUs disponibles
 	maxCPUs := runtime.NumCPU()
@@ -1248,7 +1375,7 @@ func main() {
 			// Ejecutar el benchmark múltiples veces
 			for i := 1; i <= *numRepeticiones; i++ {
 				fmt.Printf("  Ejecución %d/%d... ", i, *numRepeticiones)
-				printMemUsage()
+
 				metricaCPU, err := ProcessNDVI(
 					cfg.NIR,
 					cfg.RED,
@@ -1294,7 +1421,6 @@ func main() {
 		// Ejecutar el benchmark múltiples veces para GPU
 		for i := 1; i <= *numRepeticiones; i++ {
 			fmt.Printf("  Ejecución %d/%d... ", i, *numRepeticiones)
-			printMemUsage()
 			metricaGPU, err := ProcessNDVI(
 				cfg.NIR,
 				cfg.RED,
