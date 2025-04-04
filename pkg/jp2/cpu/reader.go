@@ -6,7 +6,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/luismi/jp2_processing/internal/cgo/openjpeg"
 	"github.com/luismi/jp2_processing/pkg/jp2"
 	"github.com/luismi/jp2_processing/pkg/metrics"
 )
@@ -58,12 +57,6 @@ func (r *Reader) Read(filePath string, threads int) (*jp2.BandResult, error) {
 		return nil, fmt.Errorf("could not create JP2 codec")
 	}
 	defer C.opj_destroy_codec(codec)
-
-	// Configure callbacks
-	errorCb, warningCb, infoCb := openjpeg.GetCallbacks()
-	C.opj_set_error_handler(codec, C.opj_msg_callback(errorCb), nil)
-	C.opj_set_warning_handler(codec, C.opj_msg_callback(warningCb), nil)
-	C.opj_set_info_handler(codec, C.opj_msg_callback(infoCb), nil)
 
 	// Configure parameters
 	parameters := C.opj_dparameters_t{}
