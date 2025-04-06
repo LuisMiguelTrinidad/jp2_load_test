@@ -24,14 +24,17 @@ type Metrics struct {
 	NDVIAverage   float64
 	NumTilesNIR   int
 	NumTilesRED   int
+	CPUMetrics    CPUMetrics
 }
 
 // ReadMetrics contains metrics associated with reading a JP2 file
 type ReadMetrics struct {
-	FileTime   time.Duration
-	DecodeTime time.Duration
-	NumTiles   int
-	TotalTime  time.Duration
+	FileTime    time.Duration
+	DecodeTime  time.Duration
+	NumTiles    int
+	TotalTime   time.Duration
+	ParseTime   time.Duration
+	GetInfoTime time.Duration
 }
 
 // NDVIMetrics contains metrics for NDVI calculation
@@ -48,4 +51,11 @@ type NDVIMetrics struct {
 type ColorMetrics struct {
 	Time      time.Duration
 	ImageSize int64
+}
+
+// CPUMetrics contains CPU-specific time metrics
+type CPUMetrics struct {
+	FileTime   time.Duration
+	DecodeTime time.Duration
+	TotalTime  time.Duration
 }

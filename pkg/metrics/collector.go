@@ -71,6 +71,15 @@ func (c *Collector) SetSaveTime(time time.Duration) {
 	c.metrics.SaveTime = time
 }
 
+// SetCPUMetrics sets CPU-specific time metrics
+func (c *Collector) SetCPUMetrics(fileTime, decodeTime, totalTime time.Duration) {
+	c.metrics.CPUMetrics = CPUMetrics{
+		FileTime:   fileTime,
+		DecodeTime: decodeTime,
+		TotalTime:  totalTime,
+	}
+}
+
 // GetMetrics returns the collected metrics
 func (c *Collector) GetMetrics() *Metrics {
 	return c.metrics

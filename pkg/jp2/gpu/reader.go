@@ -52,15 +52,21 @@ func (r *Reader) Read(filePath string, threads int) (*jp2.BandResult, error) {
 	cFilePath := C.CString(filePath)
 	defer C.free(unsafe.Pointer(cFilePath))
 
+	// Add detailed debug information and metrics collection for GPU operations
+	startParse := time.Now()
 	if status := C.nvjpeg2kStreamParseFile(handle, cFilePath, stream); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return nil, fmt.Errorf("failed to parse file: %v", status)
 	}
+	parseTime := time.Since(startParse)
+	fmt.Printf("Debug: Parse Time: %v\n", parseTime)
 
-	// Get image information
+	startGetInfo := time.Now()
 	var imageInfo C.nvjpeg2kImageInfo_t
 	if status := C.nvjpeg2kStreamGetImageInfo(stream, &imageInfo); status != C.NVJPEG2K_STATUS_SUCCESS {
 		return nil, fmt.Errorf("failed to get image info: %v", status)
 	}
+	getInfoTime := time.Since(startGetInfo)
+	fmt.Printf("Debug: Get Info Time: %v\n", getInfoTime)
 
 	result.Metrics.FileTime = time.Since(startFile)
 
@@ -209,10 +215,25 @@ func (r *Reader) Read(filePath string, threads int) (*jp2.BandResult, error) {
 		}
 	}
 
+	decodeTime := time.Since(startDecode)
+	fmt.Printf("Debug: Decode Time: %v\n", decodeTime)
+
+	// Add metrics to result
+	result.Metrics.ParseTime = parseTime
+	result.Metrics.GetInfoTime = getInfoTime
+	result.Metrics.DecodeTime = decodeTime
+
 	result.Metrics.DecodeTime = time.Since(startDecode)
 	result.Metrics.NumTiles = int(imageInfo.num_tiles_x * imageInfo.num_tiles_y)
 	result.Metrics.TotalTime = time.Since(startTotal)
 	result.Image = jp2Image
+
+	// Present metrics in a table at the end
+	fmt.Println("\n=== GPU Metrics ===")
+	fmt.Printf("%-20s %-10s\n", "Metric", "Time (ms)")
+	fmt.Printf("%-20s %-10.2f\n", "Parse Time", parseTime.Seconds()*1000)
+	fmt.Printf("%-20s %-10.2f\n", "Get Info Time", getInfoTime.Seconds()*1000)
+	fmt.Printf("%-20s %-10.2f\n", "Decode Time", decodeTime.Seconds()*1000)
 
 	return result, nil
 }

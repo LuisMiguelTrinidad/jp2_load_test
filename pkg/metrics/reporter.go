@@ -151,6 +151,26 @@ func PrintScalabilityAnalysis(metricas []*Metrics, groupByResolution bool) {
 	}
 }
 
+// PrintCPUMetricsTable prints a table with CPU-specific time metrics
+func PrintCPUMetricsTable(metrics []*Metrics) {
+	fmt.Println("\n=== CPU-Specific Time Metrics ===")
+	fmt.Println("┌──────────────┬───────────────┬───────────────┬───────────────┐")
+	fmt.Printf("│ %-12s │ %-13s │ %-13s │ %-13s │\n", "Resolution", "File Time", "Decode Time", "Total Time")
+	fmt.Println("├──────────────┼───────────────┼───────────────┼───────────────┤")
+
+	for _, m := range metrics {
+		if m.ProcessorType == "CPU" {
+			fmt.Printf("│ %-12s │ %-13s │ %-13s │ %-13s │\n",
+				m.Resolution,
+				m.CPUMetrics.FileTime.String(),
+				m.CPUMetrics.DecodeTime.String(),
+				m.CPUMetrics.TotalTime.String())
+		}
+	}
+
+	fmt.Println("└──────────────┴───────────────┴───────────────┴───────────────┘")
+}
+
 // getMagnitudeAndUnit returns the appropriate magnitude and unit for a duration
 func getMagnitudeAndUnit(d time.Duration) (float64, string) {
 	if d < time.Microsecond {
